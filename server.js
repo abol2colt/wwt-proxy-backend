@@ -9,12 +9,15 @@ const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:4200";
 const USE_SOCKS_PROXY = process.env.USE_SOCKS_PROXY === "true";
-const SOCKS_PROXY_URL = process.env.SOCKS_PROXY_URL ?? "socks5://127.0.0.1:1080";
+const SOCKS_PROXY_URL =
+  process.env.SOCKS_PROXY_URL ?? "socks5://127.0.0.1:1080";
 
 app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
-const proxyAgent = USE_SOCKS_PROXY ? new SocksProxyAgent(SOCKS_PROXY_URL) : undefined;
+const proxyAgent = USE_SOCKS_PROXY
+  ? new SocksProxyAgent(SOCKS_PROXY_URL)
+  : undefined;
 
 const wttMappings = {
   redesign: { project_id: 22, service_id: 1, contract_id: 1 }, // 22 = WTT
@@ -47,13 +50,116 @@ function getMissingEnv(keys) {
   return keys.filter((key) => !process.env[key]);
 }
 
+const WORK_SESSION_GAP_LIMIT_MINUTES = 90;
+const MIN_WORKLOG_DURATION_MINUTES = 45;
+const MIN_MINUTES_PER_COMMIT = 30;
+
+function toMinutesBetween(start, end) {
+  return Math.max(
+    0,
+    Math.round((new Date(end).getTime() - new Date(start).getTime()) / 60000),
+  );
+}
+
+function toTimeHHMM(dateValue) {
+  const date = new Date(dateValue);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function calculateEvidenceTimeSuggestion(commits) {
+  const sortedCommits = [...commits]
+    .filter((commit) => commit.created_at)
+    .sort(
+      (a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+
+  if (sortedCommits.length === 0) {
+    return {
+      suggestedStartTime: "",
+      suggestedEndTime: "",
+      suggestedDurationMinutes: 0,
+      excludedGapMinutes: 0,
+      confidenceScore: 50,
+      confidenceLabel: "manual-review",
+      reasoning: "No commit timestamp was available.",
+    };
+  }
+
+  let suggestedDurationMinutes = 0;
+  let excludedGapMinutes = 0;
+
+  for (let index = 1; index < sortedCommits.length; index += 1) {
+    const previous = sortedCommits[index - 1];
+    const current = sortedCommits[index];
+    const gapMinutes = toMinutesBetween(
+      previous.created_at,
+      current.created_at,
+    );
+
+    if (gapMinutes <= WORK_SESSION_GAP_LIMIT_MINUTES) {
+      suggestedDurationMinutes += gapMinutes;
+    } else {
+      excludedGapMinutes += gapMinutes;
+    }
+  }
+
+  const effortFloorMinutes = Math.max(
+    MIN_WORKLOG_DURATION_MINUTES,
+    sortedCommits.length * MIN_MINUTES_PER_COMMIT,
+  );
+
+  suggestedDurationMinutes = Math.max(
+    suggestedDurationMinutes,
+    effortFloorMinutes,
+  );
+
+  const firstCommitAt = sortedCommits[0].created_at;
+  const rawLastCommitAt = sortedCommits[sortedCommits.length - 1].created_at;
+  const suggestedEndAt = new Date(
+    new Date(firstCommitAt).getTime() + suggestedDurationMinutes * 60000,
+  ).toISOString();
+
+  const lastCommitAt = suggestedEndAt;
+  const confidenceScore =
+    sortedCommits.length >= 3 && excludedGapMinutes === 0
+      ? 88
+      : sortedCommits.length >= 2
+        ? 78
+        : 65;
+
+  return {
+    suggestedStartTime: toTimeHHMM(firstCommitAt),
+    suggestedEndTime: toTimeHHMM(lastCommitAt),
+    suggestedDurationMinutes,
+    excludedGapMinutes,
+    confidenceScore,
+    confidenceLabel:
+      confidenceScore >= 85
+        ? "high"
+        : confidenceScore >= 70
+          ? "medium"
+          : "needs-review",
+    reasoning:
+      excludedGapMinutes > 0
+        ? `فاصله‌های زمانی طولانیِ بیش از ${WORK_SESSION_GAP_LIMIT_MINUTES} دقیقه محاسبه نشدند و حداقل زمان استاندارد برای فعالیت‌ها لحاظ شد.`
+        : "به دلیل نزدیک بودن زمانِ کامیت‌ها به یکدیگر، حداقل زمان استاندارد اعمال شد تا پیشنهاد گزارش کار واقعی‌تر باشد.",
+    firstEvidenceAt: firstCommitAt,
+    lastEvidenceAt: lastCommitAt,
+  };
+}
+
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     service: "wtt-proxy",
     jiraMode: "mock",
-    gitProvider: process.env.GITLAB_URL ? "gitlab-compatible" : "not-configured",
-    aiProvider: process.env.GEMINI_MODEL ? "gemini-compatible" : "not-configured",
+    gitProvider: process.env.GITLAB_URL
+      ? "gitlab-compatible"
+      : "not-configured",
+    aiProvider: process.env.GEMINI_MODEL
+      ? "gemini-compatible"
+      : "not-configured",
   });
 });
 
@@ -134,16 +240,26 @@ app.get("/api/sync-gitlab", async (req, res) => {
       proxyAgent ? { httpsAgent: proxyAgent } : undefined,
     );
 
+    const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
+
     res.json({
       success: true,
       description: aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
-      durationMinutes: commits.length * 45, // Temporary MVP heuristic. Branch 016 replaces this.
+      durationMinutes: timeSuggestion.suggestedDurationMinutes,
+      suggestedStartTime: timeSuggestion.suggestedStartTime,
+      suggestedEndTime: timeSuggestion.suggestedEndTime,
+      suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
+      excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+      confidenceScore: timeSuggestion.confidenceScore,
+      confidenceLabel: timeSuggestion.confidenceLabel,
       evidence: {
         taskKey,
         branch,
         commitCount: commits.length,
-        firstCommitAt: commits[commits.length - 1]?.created_at,
-        lastCommitAt: commits[0]?.created_at,
+        firstCommitAt: timeSuggestion.firstEvidenceAt,
+        lastCommitAt: timeSuggestion.lastEvidenceAt,
+        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+        reasoning: timeSuggestion.reasoning,
       },
     });
   } catch (err) {
@@ -152,12 +268,14 @@ app.get("/api/sync-gitlab", async (req, res) => {
     console.error("Sync failed", {
       status,
       message: err.message,
-      providerMessage: err.response?.data?.message ?? err.response?.data?.error?.message,
+      providerMessage:
+        err.response?.data?.message ?? err.response?.data?.error?.message,
     });
 
     res.status(500).json({
       success: false,
-      error: "GitLab/AI sync failed. Check proxy logs and local environment configuration.",
+      error:
+        "GitLab/AI sync failed. Check proxy logs and local environment configuration.",
     });
   }
 });
