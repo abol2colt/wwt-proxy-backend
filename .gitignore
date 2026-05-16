@@ -4,3 +4,4 @@
 node_modules
 gitlab/
 .DS_Store
+*.log

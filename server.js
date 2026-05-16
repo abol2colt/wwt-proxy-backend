@@ -5,10 +5,16 @@ const cors = require("cors");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 
 const app = express();
-app.use(cors({ origin: "http://localhost:4200" }));
+
+const PORT = Number(process.env.PORT ?? 3000);
+const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:4200";
+const USE_SOCKS_PROXY = process.env.USE_SOCKS_PROXY === "true";
+const SOCKS_PROXY_URL = process.env.SOCKS_PROXY_URL ?? "socks5://127.0.0.1:1080";
+
+app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
-const proxyAgent = new SocksProxyAgent("socks5://127.0.0.1:1080");
+const proxyAgent = USE_SOCKS_PROXY ? new SocksProxyAgent(SOCKS_PROXY_URL) : undefined;
 
 const wttMappings = {
   redesign: { project_id: 22, service_id: 1, contract_id: 1 }, // 22 = WTT
@@ -37,6 +43,20 @@ const mockJiraIssues = [
   },
 ];
 
+function getMissingEnv(keys) {
+  return keys.filter((key) => !process.env[key]);
+}
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "wtt-proxy",
+    jiraMode: "mock",
+    gitProvider: process.env.GITLAB_URL ? "gitlab-compatible" : "not-configured",
+    aiProvider: process.env.GEMINI_MODEL ? "gemini-compatible" : "not-configured",
+  });
+});
+
 app.get("/api/jira/mock-tasks", (req, res) => {
   const response = mockJiraIssues.map((issue) => ({
     id: issue.key,
@@ -46,19 +66,43 @@ app.get("/api/jira/mock-tasks", (req, res) => {
     service_id: issue.mapping.service_id,
     contract_id: issue.mapping.contract_id,
     branch_name: issue.branch,
+    source: "mock-jira",
   }));
+
   res.json(response);
 });
 
 app.get("/api/sync-gitlab", async (req, res) => {
   const { taskKey, branch } = req.query;
+
+  if (!taskKey || !branch) {
+    return res.status(400).json({
+      success: false,
+      error: "taskKey and branch are required.",
+    });
+  }
+
+  const missingEnv = getMissingEnv([
+    "GITLAB_URL",
+    "PROJECT_ID",
+    "GITLAB_TOKEN",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+  ]);
+
+  if (missingEnv.length > 0) {
+    return res.status(500).json({
+      success: false,
+      error: `Proxy configuration is incomplete: ${missingEnv.join(", ")}`,
+    });
+  }
+
   try {
-    // فقط کامیت‌های همون برنچ رو بگیر
     const resp = await axios.get(
       `${process.env.GITLAB_URL}/api/v4/projects/${process.env.PROJECT_ID}/repository/commits`,
       {
         headers: { "PRIVATE-TOKEN": process.env.GITLAB_TOKEN },
-        params: { ref_name: branch, per_page: 5 },
+        params: { ref_name: branch, per_page: 20 },
       },
     );
 
@@ -68,29 +112,57 @@ app.get("/api/sync-gitlab", async (req, res) => {
       return res.json({
         success: false,
         description: "کامیتی در این برنچ یافت نشد.",
+        durationMinutes: 0,
       });
     }
 
-    const prompt = `فقط یک گزارش کارکرد فارسی کامل  با بولت پوینت (-) از این کامیت‌ها بساز:\n${commits.map((c) => c.title).join("\n")}`;
+    const prompt = [
+      "از روی عنوان کامیت‌های زیر، یک گزارش کارکرد فارسی کامل اما خلاصه تولید کن.",
+      "خروجی فقط شامل بولت پوینت باشد.",
+      "قطعیت بیش از حد نده؛ متن باید به عنوان پیش‌نویس قابل بررسی توسط برنامه‌نویس باشد.",
+      "",
+      `Task: ${taskKey}`,
+      `Branch: ${branch}`,
+      "",
+      "Commits:",
+      commits.map((c) => `- ${c.title}`).join("\n"),
+    ].join("\n");
+
     const aiResp = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents: [{ parts: [{ text: prompt }] }] },
-      { httpsAgent: proxyAgent },
+      proxyAgent ? { httpsAgent: proxyAgent } : undefined,
     );
 
     res.json({
       success: true,
-      description: aiResp.data.candidates[0].content.parts[0].text,
-      durationMinutes: commits.length * 45, // هر کامیت ۴۵ دقیقه
+      description: aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
+      durationMinutes: commits.length * 45, // Temporary MVP heuristic. Branch 016 replaces this.
+      evidence: {
+        taskKey,
+        branch,
+        commitCount: commits.length,
+        firstCommitAt: commits[commits.length - 1]?.created_at,
+        lastCommitAt: commits[0]?.created_at,
+      },
     });
   } catch (err) {
-    console.error("❌ Sync Error Details:", err.response?.data || err.message);
+    const status = err.response?.status ?? 500;
+
+    console.error("Sync failed", {
+      status,
+      message: err.message,
+      providerMessage: err.response?.data?.message ?? err.response?.data?.error?.message,
+    });
+
     res.status(500).json({
       success: false,
-      error:
-        err.response?.data?.error?.message || err.message || "Internal Error",
+      error: "GitLab/AI sync failed. Check proxy logs and local environment configuration.",
     });
   }
 });
 
-app.listen(3000, () => console.log("🚀 Proxy up on 3000"));
+app.listen(PORT, () => {
+  console.log(`Proxy up on ${PORT}`);
+  console.log(`CORS origin: ${CORS_ORIGIN}`);
+});
