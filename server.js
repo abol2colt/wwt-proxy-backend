@@ -46,8 +46,8 @@ const mockJiraIssues = [
   },
 ];
 
-function getMissingEnv(keys) {
-  return keys.filter((key) => !process.env[key]);
+function getGitlabProjectId() {
+  return process.env.GITLAB_PROJECT_ID || process.env.PROJECT_ID;
 }
 
 const WORK_SESSION_GAP_LIMIT_MINUTES = 90;
@@ -115,7 +115,6 @@ function calculateEvidenceTimeSuggestion(commits) {
   );
 
   const firstCommitAt = sortedCommits[0].created_at;
-  const rawLastCommitAt = sortedCommits[sortedCommits.length - 1].created_at;
   const suggestedEndAt = new Date(
     new Date(firstCommitAt).getTime() + suggestedDurationMinutes * 60000,
   ).toISOString();
@@ -149,22 +148,90 @@ function calculateEvidenceTimeSuggestion(commits) {
   };
 }
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "wtt-proxy",
-    jiraMode: "mock",
-    gitProvider: process.env.GITLAB_URL
-      ? "gitlab-compatible"
-      : "not-configured",
-    aiProvider: process.env.GEMINI_MODEL
-      ? "gemini-compatible"
-      : "not-configured",
-  });
-});
+function isMockIntegrationMode() {
+  return process.env.ENABLE_INTEGRATION_MOCK_MODE !== "false";
+}
 
-app.get("/api/jira/mock-tasks", (req, res) => {
-  const response = mockJiraIssues.map((issue) => ({
+function getRequiredEnvMissing(keys) {
+  return keys.filter((key) => !process.env[key]);
+}
+
+function getGitlabMissingEnv() {
+  const missing = getRequiredEnvMissing(["GITLAB_URL", "GITLAB_TOKEN"]);
+
+  if (!getGitlabProjectId()) {
+    missing.push("GITLAB_PROJECT_ID");
+  }
+
+  return missing;
+}
+
+function getAiMissingEnv() {
+  return getRequiredEnvMissing(["GEMINI_API_KEY", "GEMINI_MODEL"]);
+}
+
+function getJiraMissingEnv() {
+  return getRequiredEnvMissing([
+    "JIRA_BASE_URL",
+    "JIRA_EMAIL",
+    "JIRA_API_TOKEN",
+    "JIRA_JQL",
+  ]);
+}
+
+function getJiraMode() {
+  if (isMockIntegrationMode()) {
+    return "mock";
+  }
+
+  return getJiraMissingEnv().length === 0 ? "real" : "not-configured";
+}
+
+function getGitlabMode() {
+  return getGitlabMissingEnv().length === 0 ? "real" : "not-configured";
+}
+
+function getAiMode() {
+  return getAiMissingEnv().length === 0 ? "real" : "not-configured";
+}
+
+function getIntegrationMissingEnv() {
+  const missing = [];
+
+  if (!isMockIntegrationMode()) {
+    missing.push(...getJiraMissingEnv());
+  }
+
+  missing.push(...getGitlabMissingEnv(), ...getAiMissingEnv());
+
+  return [...new Set(missing)];
+}
+
+function requireEnv(keys) {
+  const missing = keys.filter((key) => !process.env[key]);
+  if (missing.length > 0) {
+    const error = new Error(`Missing env: ${missing.join(", ")}`);
+    error.statusCode = 500;
+    throw error;
+  }
+  return true;
+}
+
+function requireGitlabAndAiEnv() {
+  const missing = [...getGitlabMissingEnv(), ...getAiMissingEnv()];
+
+  if (missing.length > 0) {
+    const error = new Error(`Missing env: ${missing.join(", ")}`);
+    error.statusCode = 500;
+    error.missingEnv = missing;
+    throw error;
+  }
+
+  return true;
+}
+
+function mapMockJiraIssueToExternalTask(issue) {
+  return {
     id: issue.key,
     key: issue.key,
     title: issue.title,
@@ -173,7 +240,59 @@ app.get("/api/jira/mock-tasks", (req, res) => {
     contract_id: issue.mapping.contract_id,
     branch_name: issue.branch,
     source: "mock-jira",
-  }));
+  };
+}
+
+function mapJiraIssueToExternalTask(issue) {
+  const key = issue.key;
+  const summary = issue.fields?.summary ?? key;
+  const prefix = key.split("-")[0]?.toLowerCase();
+
+  const mapping = wttMappings[prefix] ?? wttMappings.redesign;
+
+  return {
+    id: key,
+    key,
+    title: summary,
+    project_id: mapping.project_id,
+    service_id: mapping.service_id,
+    contract_id: mapping.contract_id,
+    branch_name: `feature/${key}`,
+    status: issue.fields?.status?.name,
+    source: "jira",
+  };
+}
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "wtt-proxy",
+    jiraMode: getJiraMode(),
+    gitProvider:
+      getGitlabMode() === "real" ? "gitlab-compatible" : "not-configured",
+    aiProvider:
+      getAiMode() === "real" ? "gemini-compatible" : "not-configured",
+  });
+});
+
+app.get("/api/integrations/status", (req, res) => {
+  res.json({
+    ok: true,
+    jira: {
+      mode: getJiraMode(),
+    },
+    gitlab: {
+      mode: getGitlabMode(),
+    },
+    ai: {
+      mode: getAiMode(),
+    },
+    missingEnv: getIntegrationMissingEnv(),
+  });
+});
+
+// Legacy manual-testing route. This always returns mock tasks regardless of mock-mode env.
+app.get("/api/jira/mock-tasks", (req, res) => {
+  const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
 
   res.json(response);
 });
@@ -181,34 +300,33 @@ app.get("/api/jira/mock-tasks", (req, res) => {
 app.get("/api/sync-gitlab", async (req, res) => {
   const { taskKey, branch } = req.query;
 
-  if (!taskKey || !branch) {
+  if (!taskKey) {
     return res.status(400).json({
       success: false,
-      error: "taskKey and branch are required.",
-    });
-  }
-
-  const missingEnv = getMissingEnv([
-    "GITLAB_URL",
-    "PROJECT_ID",
-    "GITLAB_TOKEN",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
-  ]);
-
-  if (missingEnv.length > 0) {
-    return res.status(500).json({
-      success: false,
-      error: `Proxy configuration is incomplete: ${missingEnv.join(", ")}`,
+      error: "taskKey is required.",
     });
   }
 
   try {
+    requireGitlabAndAiEnv();
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: `Proxy configuration is incomplete: ${err.missingEnv.join(", ")}`,
+    });
+  }
+
+  try {
+    const projectId = getGitlabProjectId();
+    const commitParams = branch
+      ? { ref_name: branch, per_page: 20 }
+      : { search: taskKey, per_page: 20 };
+
     const resp = await axios.get(
-      `${process.env.GITLAB_URL}/api/v4/projects/${process.env.PROJECT_ID}/repository/commits`,
+      `${process.env.GITLAB_URL}/api/v4/projects/${projectId}/repository/commits`,
       {
         headers: { "PRIVATE-TOKEN": process.env.GITLAB_TOKEN },
-        params: { ref_name: branch, per_page: 20 },
+        params: commitParams,
       },
     );
 
@@ -217,7 +335,9 @@ app.get("/api/sync-gitlab", async (req, res) => {
     if (!commits || commits.length === 0) {
       return res.json({
         success: false,
-        description: "کامیتی در این برنچ یافت نشد.",
+        description: branch
+          ? "کامیتی در این برنچ یافت نشد."
+          : "کامیتی برای این taskKey یافت نشد.",
         durationMinutes: 0,
       });
     }
@@ -228,7 +348,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
       "قطعیت بیش از حد نده؛ متن باید به عنوان پیش‌نویس قابل بررسی توسط برنامه‌نویس باشد.",
       "",
       `Task: ${taskKey}`,
-      `Branch: ${branch}`,
+      `Branch: ${branch || "not provided; searched commits by task key"}`,
       "",
       "Commits:",
       commits.map((c) => `- ${c.title}`).join("\n"),
@@ -254,7 +374,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
       confidenceLabel: timeSuggestion.confidenceLabel,
       evidence: {
         taskKey,
-        branch,
+        branch: branch || undefined,
         commitCount: commits.length,
         firstCommitAt: timeSuggestion.firstEvidenceAt,
         lastCommitAt: timeSuggestion.lastEvidenceAt,
@@ -280,7 +400,52 @@ app.get("/api/sync-gitlab", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Proxy up on ${PORT}`);
+app.get("/api/jira/assigned-tasks", async (req, res) => {
+  if (isMockIntegrationMode()) {
+    const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+
+    return res.json(response);
+  }
+
+  try {
+    requireEnv(["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_JQL"]);
+    const jiraApiVersion = process.env.JIRA_API_VERSION || "3";
+
+    const response = await axios.get(
+      `${process.env.JIRA_BASE_URL}/rest/api/${jiraApiVersion}/search`,
+      {
+        auth: {
+          username: process.env.JIRA_EMAIL,
+          password: process.env.JIRA_API_TOKEN,
+        },
+        params: {
+          jql: process.env.JIRA_JQL,
+          maxResults: 20,
+          fields: "summary,status,issuetype,updated",
+        },
+      },
+    );
+
+    return res.json(
+      (response.data.issues ?? []).map(mapJiraIssueToExternalTask),
+    );
+  } catch (err) {
+    console.error("Jira assigned tasks failed", {
+      status: err.response?.status,
+      message: err.message,
+      providerMessage: err.response?.data,
+    });
+
+    return res.status(err.statusCode ?? 500).json({
+      success: false,
+      error: "Jira assigned tasks failed. Check proxy configuration.",
+    });
+  }
+});
+
+const HOST = process.env.HOST ?? "0.0.0.0";
+
+app.listen(PORT, HOST, () => {
+  console.log(`Proxy up on http://${HOST}:${PORT}`);
   console.log(`CORS origin: ${CORS_ORIGIN}`);
 });
