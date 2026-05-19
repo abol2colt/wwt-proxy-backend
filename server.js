@@ -19,6 +19,19 @@ const proxyAgent = USE_SOCKS_PROXY
   ? new SocksProxyAgent(SOCKS_PROXY_URL)
   : undefined;
 
+function buildGeminiRequestConfig(timeout = 45000) {
+  return {
+    timeout,
+    ...(proxyAgent
+      ? {
+          httpAgent: proxyAgent,
+          httpsAgent: proxyAgent,
+          proxy: false,
+        }
+      : {}),
+  };
+}
+
 const wttMappings = {
   redesign: { project_id: 22, service_id: 1, contract_id: 1 }, // 22 = WTT
   neobrk: { project_id: 30, service_id: 1, contract_id: 1 }, // 30 = NeoBRK
@@ -269,8 +282,7 @@ app.get("/api/health", (req, res) => {
     jiraMode: getJiraMode(),
     gitProvider:
       getGitlabMode() === "real" ? "gitlab-compatible" : "not-configured",
-    aiProvider:
-      getAiMode() === "real" ? "gemini-compatible" : "not-configured",
+    aiProvider: getAiMode() === "real" ? "gemini-compatible" : "not-configured",
   });
 });
 
@@ -354,11 +366,24 @@ app.get("/api/sync-gitlab", async (req, res) => {
       commits.map((c) => `- ${c.title}`).join("\n"),
     ].join("\n");
 
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+    console.log("GitLab AI sync request started", {
+      model: process.env.GEMINI_MODEL,
+      promptLength: prompt.length,
+      commitCount: commits.length,
+      useSocksProxy: USE_SOCKS_PROXY,
+    });
+
     const aiResp = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents: [{ parts: [{ text: prompt }] }] },
-      proxyAgent ? { httpsAgent: proxyAgent } : undefined,
+      buildGeminiRequestConfig(45000),
     );
+
+    console.log("AI Report request finished", {
+      status: aiResp.status,
+    });
 
     const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
 
@@ -384,18 +409,31 @@ app.get("/api/sync-gitlab", async (req, res) => {
     });
   } catch (err) {
     const status = err.response?.status ?? 500;
+    const providerMessage =
+      err.code === "ECONNABORTED"
+        ? "AI provider request timed out after 45 seconds."
+        : (err.response?.data?.error?.message ??
+          err.response?.data?.message ??
+          err.message);
 
-    console.error("Sync failed", {
+    console.error("AI Report Gen failed", {
       status,
+      code: err.code,
       message: err.message,
-      providerMessage:
-        err.response?.data?.message ?? err.response?.data?.error?.message,
+      providerMessage,
     });
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      error:
-        "GitLab/AI sync failed. Check proxy logs and local environment configuration.",
+      error: "AI Summary generation failed. Check proxy and AI configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              code: err.code,
+              providerMessage,
+            }
+          : undefined,
     });
   }
 });
@@ -439,6 +477,172 @@ app.get("/api/jira/assigned-tasks", async (req, res) => {
     return res.status(err.statusCode ?? 500).json({
       success: false,
       error: "Jira assigned tasks failed. Check proxy configuration.",
+    });
+  }
+});
+
+function reportPurposeInstruction(purpose) {
+  switch (purpose) {
+    case "daily":
+      return "هدف گزارش: ارائه دیلی خیلی کوتاه. خروجی باید نهایتاً ۵ بولت کوتاه باشد و روی کارهای انجام‌شده تمرکز کند.";
+    case "lead":
+      return "هدف گزارش: ارائه به لید فنی. خروجی باید شامل کارهای انجام‌شده، ریسک‌ها، وابستگی‌ها و قدم بعدی باشد.";
+    case "self_review":
+      return "هدف گزارش: ارزیابی شخصی. خروجی باید نقاط قوت، کمبودها، تمرکز زمانی و پیشنهاد بهبود فردی را بگوید.";
+    case "managerial":
+      return "هدف گزارش: گزارش مدیریتی. خروجی باید رسمی، خلاصه، نتیجه‌محور و قابل ارائه به مدیر باشد.";
+    default:
+      return "هدف گزارش: خلاصه عملکرد کاری.";
+  }
+}
+
+function truncateText(value, maxLength = 240) {
+  return String(value ?? "").slice(0, maxLength);
+}
+
+app.post("/api/reports/ai-summary", async (req, res) => {
+  const missingAiEnv = getAiMissingEnv();
+
+  if (missingAiEnv.length > 0) {
+    return res.status(500).json({
+      success: false,
+      error: `AI configuration is incomplete: ${missingAiEnv.join(", ")}`,
+    });
+  }
+
+  const {
+    rangeLabel = "",
+    purpose = "daily",
+    tone = "managerial",
+    detailLevel = "balanced",
+    language = "fa",
+    attendanceSummary = {},
+    topActivities = [],
+    tasks = [],
+  } = req.body ?? {};
+
+  const safeTopActivities = Array.isArray(topActivities)
+    ? topActivities.slice(0, 8)
+    : [];
+
+  const safeTasks = Array.isArray(tasks)
+    ? tasks.slice(0, 20).map((task) => ({
+        id: task.id,
+        title: truncateText(task.title, 160),
+        projectTitle: truncateText(task.projectTitle, 80),
+        date: truncateText(task.date, 32),
+        durationMinutes: Number(task.durationMinutes ?? 0),
+        status: truncateText(task.status, 40),
+        description: truncateText(task.description, 260),
+      }))
+    : [];
+
+  const promptLines = [
+    "شما یک دستیار هوش مصنوعی برای تولید گزارش عملکرد پرسنل هستید.",
+    "بر اساس داده‌های واقعی WTT، یک گزارش فارسی حرفه‌ای و قابل بازبینی تولید کن.",
+    "بدون ادعای قطعی و بدون ساختن داده جدید بنویس؛ فقط از داده‌های داده‌شده استفاده کن.",
+    `لحن گزارش: ${tone}`,
+    `سطح جزئیات: ${detailLevel}`,
+    `زبان خروجی: ${language}`,
+    reportPurposeInstruction(purpose),
+    "",
+    `بازه زمانی: ${rangeLabel}`,
+    "خلاصه حضور و غیاب:",
+    `- مجموع حضور: ${attendanceSummary.presenceMinutes ?? 0} دقیقه`,
+    `- کل کارکرد: ${attendanceSummary.totalWorkMinutes ?? 0} دقیقه`,
+    `- کارکرد مورد انتظار: ${attendanceSummary.expectedMinutes ?? 0} دقیقه`,
+    `- اضافه‌کار/کسرکار: ${attendanceSummary.overtimeMinutes ?? 0} دقیقه`,
+    `- راندمان میانگین: ${attendanceSummary.averageEfficiency ?? 0}%`,
+    `- روزهای دارای تسک: ${attendanceSummary.taskDays ?? 0} روز`,
+    `- تعداد ناهار: ${attendanceSummary.lunches ?? 0}`,
+    `- روزهای بدون کارکرد: ${attendanceSummary.noWorkDays ?? 0} روز`,
+    `- مرخصی تاییدشده: ${attendanceSummary.acceptedVacations ?? 0}`,
+    `- ماموریت تاییدشده: ${attendanceSummary.acceptedMissions ?? 0}`,
+    "",
+    "عمده فعالیت‌ها:",
+  ];
+
+  safeTopActivities.forEach((act) => {
+    promptLines.push(
+      `- پروژه ${truncateText(act.projectName, 80)} (${truncateText(act.serviceName, 80)}): ${Number(act.spentMinutes ?? 0)} دقیقه (${truncateText(act.percentageText, 24)})`,
+    );
+  });
+
+  promptLines.push("", "تسک‌های ثبت‌شده در این بازه:");
+
+  safeTasks.forEach((task) => {
+    promptLines.push(
+      `- [${task.id}] ${task.title} | پروژه: ${task.projectTitle} | تاریخ: ${task.date} | مدت: ${task.durationMinutes} دقیقه | وضعیت: ${task.status} | توضیح: ${task.description || "بدون توضیح"}`,
+    );
+  });
+
+  promptLines.push(
+    "",
+    "خروجی را منظم، خوانا و آماده ارائه بنویس. اگر هدف daily است خیلی کوتاه بنویس. اگر هدف lead است، ریسک‌ها و قدم بعدی را هم اضافه کن. اگر هدف self_review است، پیشنهاد بهبود فردی بده.",
+  );
+
+  const prompt = promptLines.join("\n");
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+  console.log("AI Report request started", {
+    model: process.env.GEMINI_MODEL,
+    promptLength: prompt.length,
+    taskCount: safeTasks.length,
+    topActivityCount: safeTopActivities.length,
+    useSocksProxy: USE_SOCKS_PROXY,
+  });
+
+  try {
+    const aiResp = await axios.post(
+      geminiUrl,
+      {
+        contents: [
+          {
+            parts: [{ text: prompt }],
+          },
+        ],
+      },
+      buildGeminiRequestConfig(45000),
+    );
+    console.log("AI Report request finished", {
+      status: aiResp.status,
+    });
+
+    const generatedText =
+      aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+    return res.json({
+      success: true,
+      summary: generatedText,
+      model: process.env.GEMINI_MODEL,
+    });
+  } catch (err) {
+    const status = err.response?.status ?? 500;
+    const providerMessage =
+      err.code === "ECONNABORTED"
+        ? "AI provider request timed out after 45 seconds."
+        : (err.response?.data?.error?.message ??
+          err.response?.data?.message ??
+          err.message);
+
+    console.error("AI Report Gen failed", {
+      status,
+      code: err.code,
+      message: err.message,
+      providerMessage,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: "AI Summary generation failed. Check proxy and AI configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              code: err.code,
+              providerMessage,
+            }
+          : undefined,
     });
   }
 });
