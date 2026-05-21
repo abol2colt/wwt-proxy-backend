@@ -5,3 +5,4 @@ node_modules
 gitlab/
 .DS_Store
 *.log
+.runtime-integrations.json

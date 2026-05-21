@@ -3,8 +3,10 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const { SocksProxyAgent } = require("socks-proxy-agent");
-
 const app = express();
+const fs = require("fs");
+const path = require("path");
+const RUNTIME_CONFIG_FILE = path.join(__dirname, ".runtime-integrations.json");
 
 const PORT = Number(process.env.PORT ?? 3000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:4200";
@@ -18,6 +20,20 @@ app.use(express.json());
 const proxyAgent = USE_SOCKS_PROXY
   ? new SocksProxyAgent(SOCKS_PROXY_URL)
   : undefined;
+
+function loadRuntimeIntegrationConfig() {
+  try {
+    if (!fs.existsSync(RUNTIME_CONFIG_FILE)) {
+      return { jira: null, gitlab: null };
+    }
+
+    return JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, "utf8"));
+  } catch (error) {
+    console.warn("Could not load runtime integration config", error.message);
+    return { jira: null, gitlab: null };
+  }
+}
+const runtimeIntegrationConfig = loadRuntimeIntegrationConfig();
 
 function buildGeminiRequestConfig(timeout = 45000) {
   return {
@@ -77,6 +93,92 @@ function toMinutesBetween(start, end) {
 function toTimeHHMM(dateValue) {
   const date = new Date(dateValue);
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function trimTrailingSlash(value) {
+  return String(value ?? "").replace(/\/+$/, "");
+}
+
+function maskValue(value) {
+  if (!value) return null;
+  const text = String(value);
+  if (text.length <= 6) return "******";
+  return `${text.slice(0, 3)}***${text.slice(-3)}`;
+}
+
+function saveRuntimeIntegrationConfig() {
+  fs.writeFileSync(
+    RUNTIME_CONFIG_FILE,
+    JSON.stringify(runtimeIntegrationConfig, null, 2),
+    "utf8",
+  );
+}
+
+function getRuntimeJiraConfig() {
+  return runtimeIntegrationConfig.jira;
+}
+
+function getEffectiveJiraConfig() {
+  const runtime = getRuntimeJiraConfig();
+
+  return {
+    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.JIRA_BASE_URL),
+    email: runtime?.email || process.env.JIRA_EMAIL,
+    token: runtime?.token || process.env.JIRA_API_TOKEN,
+    authType: runtime?.authType || process.env.JIRA_AUTH_TYPE || "bearer",
+    apiVersion: runtime?.apiVersion || process.env.JIRA_API_VERSION || "2",
+    jql:
+      runtime?.jql ||
+      process.env.JIRA_JQL ||
+      "statusCategory != Done ORDER BY updated DESC",
+    mapping: runtime?.mapping || null,
+  };
+}
+
+function getRuntimeGitlabConfig() {
+  return runtimeIntegrationConfig.gitlab;
+}
+
+function getEffectiveGitlabConfig() {
+  const runtime = getRuntimeGitlabConfig();
+
+  return {
+    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.GITLAB_URL),
+    username: runtime?.username || process.env.GITLAB_USERNAME || "",
+    token: runtime?.token || process.env.GITLAB_TOKEN,
+    projectId:
+      runtime?.projectId ||
+      process.env.GITLAB_PROJECT_ID ||
+      process.env.PROJECT_ID,
+    branchPattern: runtime?.branchPattern || "feature/{TASK_KEY}",
+  };
+}
+
+function buildJiraAxiosAuthConfig(config) {
+  if (config.authType === "bearer") {
+    return {
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+      },
+    };
+  }
+
+  return {
+    auth: {
+      username: config.email,
+      password: config.token,
+    },
+  };
+}
+
+function isJiraConfigured() {
+  const jira = getEffectiveJiraConfig();
+  return Boolean(jira.baseUrl && jira.email && jira.token);
+}
+
+function isGitlabConfigured() {
+  const gitlab = getEffectiveGitlabConfig();
+  return Boolean(gitlab.baseUrl && gitlab.token && gitlab.projectId);
 }
 
 function calculateEvidenceTimeSuggestion(commits) {
@@ -169,39 +271,40 @@ function getRequiredEnvMissing(keys) {
   return keys.filter((key) => !process.env[key]);
 }
 
-function getGitlabMissingEnv() {
-  const missing = getRequiredEnvMissing(["GITLAB_URL", "GITLAB_TOKEN"]);
-
-  if (!getGitlabProjectId()) {
-    missing.push("GITLAB_PROJECT_ID");
-  }
-
-  return missing;
-}
-
 function getAiMissingEnv() {
   return getRequiredEnvMissing(["GEMINI_API_KEY", "GEMINI_MODEL"]);
 }
 
 function getJiraMissingEnv() {
-  return getRequiredEnvMissing([
-    "JIRA_BASE_URL",
-    "JIRA_EMAIL",
-    "JIRA_API_TOKEN",
-    "JIRA_JQL",
-  ]);
+  const jira = getEffectiveJiraConfig();
+  const missing = [];
+
+  if (!jira.baseUrl) missing.push("JIRA_BASE_URL");
+  if (!jira.email) missing.push("JIRA_EMAIL");
+  if (!jira.token) missing.push("JIRA_API_TOKEN");
+
+  return missing;
+}
+
+function getGitlabMissingEnv() {
+  const gitlab = getEffectiveGitlabConfig();
+  const missing = [];
+
+  if (!gitlab.baseUrl) missing.push("GITLAB_URL");
+  if (!gitlab.token) missing.push("GITLAB_TOKEN");
+  if (!gitlab.projectId) missing.push("GITLAB_PROJECT_ID");
+
+  return missing;
 }
 
 function getJiraMode() {
-  if (isMockIntegrationMode()) {
-    return "mock";
-  }
-
-  return getJiraMissingEnv().length === 0 ? "real" : "not-configured";
+  if (isJiraConfigured()) return "real";
+  if (isMockIntegrationMode()) return "mock";
+  return "not-configured";
 }
 
 function getGitlabMode() {
-  return getGitlabMissingEnv().length === 0 ? "real" : "not-configured";
+  return isGitlabConfigured() ? "real" : "not-configured";
 }
 
 function getAiMode() {
@@ -255,26 +358,208 @@ function mapMockJiraIssueToExternalTask(issue) {
     source: "mock-jira",
   };
 }
+function jiraFieldToPlainText(value) {
+  if (!value) return "";
 
-function mapJiraIssueToExternalTask(issue) {
+  if (typeof value === "string") return value;
+
+  if (Array.isArray(value)) {
+    return value.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+  }
+
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.value === "string") return value.value;
+    if (typeof value.name === "string") return value.name;
+
+    if (Array.isArray(value.content)) {
+      return value.content.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+    }
+  }
+
+  return "";
+}
+
+function parseWttMetadataBlock(text) {
+  const source = String(text ?? "");
+  const match = source.match(/WTT:?\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const lines = match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const data = {};
+
+  for (const line of lines) {
+    const [rawKey, ...rawValueParts] = line.split("=");
+    const key = rawKey?.trim();
+    const value = rawValueParts.join("=").trim();
+
+    if (key && value) {
+      data[key] = value;
+    }
+  }
+
+  return {
+    project_id: data.project_id ? Number(data.project_id) : null,
+    service_id: data.service_id ? Number(data.service_id) : null,
+    contract_id: data.contract_id ? Number(data.contract_id) : null,
+    location: data.location || null,
+    gitlab_project: data.gitlab_project || null,
+    branch_name: data.branch_name || null,
+    branch_pattern: data.branch_pattern || null,
+    mapping_source: "jira-description",
+  };
+}
+
+function readCustomField(issue, envName) {
+  const fieldId = process.env[envName];
+
+  if (!fieldId) {
+    return null;
+  }
+
+  return jiraFieldToPlainText(issue.fields?.[fieldId]).trim() || null;
+}
+
+function getTaskKeySearchAliases(taskKey) {
+  const key = String(taskKey ?? "").trim();
+  const numberPart = key.split("-")[1];
+
+  return [
+    key,
+    key.toLowerCase(),
+    numberPart ? `issue-${numberPart}` : "",
+    numberPart ? `bugfix/issue-${numberPart}` : "",
+    numberPart ? `feature/${key}` : "",
+  ].filter(Boolean);
+}
+
+function extractWttMetadataFromCustomFields(issue) {
+  const projectId = readCustomField(issue, "JIRA_WTT_PROJECT_FIELD");
+  const serviceId = readCustomField(issue, "JIRA_WTT_SERVICE_FIELD");
+  const contractId = readCustomField(issue, "JIRA_WTT_CONTRACT_FIELD");
+  const location = readCustomField(issue, "JIRA_WTT_LOCATION_FIELD");
+  const gitlabProject = readCustomField(issue, "JIRA_GITLAB_PROJECT_FIELD");
+  const branchPattern = readCustomField(issue, "JIRA_BRANCH_PATTERN_FIELD");
+
+  if (
+    !projectId &&
+    !serviceId &&
+    !contractId &&
+    !location &&
+    !gitlabProject &&
+    !branchPattern
+  ) {
+    return null;
+  }
+
+  return {
+    project_id: projectId ? Number(projectId) : null,
+    service_id: serviceId ? Number(serviceId) : null,
+    contract_id: contractId ? Number(contractId) : null,
+    location: location || null,
+    gitlab_project: gitlabProject || null,
+    branch_pattern: branchPattern || null,
+    mapping_source: "jira-custom-fields",
+  };
+}
+
+function extractWttMetadataFromJiraIssue(issue) {
+  const descriptionText = jiraFieldToPlainText(issue.fields?.description);
+  const fromDescription = parseWttMetadataBlock(descriptionText);
+
+  if (fromDescription) {
+    return fromDescription;
+  }
+
+  return extractWttMetadataFromCustomFields(issue);
+}
+
+function getConfiguredJiraSearchFields() {
+  const baseFields = [
+    "summary",
+    "status",
+    "issuetype",
+    "updated",
+    "description",
+    "project",
+    "assignee",
+    "labels",
+    "components",
+  ];
+
+  const customFields = [
+    process.env.JIRA_WTT_PROJECT_FIELD,
+    process.env.JIRA_WTT_SERVICE_FIELD,
+    process.env.JIRA_WTT_CONTRACT_FIELD,
+    process.env.JIRA_WTT_LOCATION_FIELD,
+    process.env.JIRA_GITLAB_PROJECT_FIELD,
+    process.env.JIRA_BRANCH_PATTERN_FIELD,
+  ].filter(Boolean);
+
+  return [...new Set([...baseFields, ...customFields])].join(",");
+}
+
+function buildBranchNameFromPattern(pattern, key) {
+  if (!pattern) return `feature/${key}`;
+  return pattern.replaceAll("{TASK_KEY}", key);
+}
+
+function mapJiraIssueToExternalTask(issue, runtimeMapping) {
   const key = issue.key;
   const summary = issue.fields?.summary ?? key;
-  const prefix = key.split("-")[0]?.toLowerCase();
+  const wttMetadata = extractWttMetadataFromJiraIssue(issue);
 
-  const mapping = wttMappings[prefix] ?? wttMappings.redesign;
+  const mapping = runtimeMapping
+    ? {
+        project_id: runtimeMapping.project_id,
+        service_id: runtimeMapping.service_id,
+        contract_id: runtimeMapping.contract_id,
+        mapping_source: "runtime",
+      }
+    : wttMetadata;
+
+  const branchPattern = wttMetadata?.branch_pattern || "feature/{TASK_KEY}";
+  const branchName =
+    wttMetadata?.branch_name || buildBranchNameFromPattern(branchPattern, key);
 
   return {
     id: key,
     key,
     title: summary,
-    project_id: mapping.project_id,
-    service_id: mapping.service_id,
-    contract_id: mapping.contract_id,
-    branch_name: `feature/${key}`,
+
+    project_id: mapping?.project_id ?? null,
+    service_id: mapping?.service_id ?? null,
+    contract_id: mapping?.contract_id ?? null,
+    location: wttMetadata?.location ?? null,
+
+    gitlab_project_id: wttMetadata?.gitlab_project ?? null,
+    branch_pattern: branchPattern,
+    branch_name: branchName,
+    mapping_source: mapping?.mapping_source ?? null,
+
     status: issue.fields?.status?.name,
     source: "jira",
+    raw: {
+      updated: issue.fields?.updated,
+      issueType: issue.fields?.issuetype?.name,
+      jiraProjectKey: issue.fields?.project?.key,
+      jiraProjectName: issue.fields?.project?.name,
+      assignee: issue.fields?.assignee?.displayName,
+      labels: issue.fields?.labels ?? [],
+      components: issue.fields?.components ?? [],
+      descriptionText: jiraFieldToPlainText(issue.fields?.description),
+      wttMetadata,
+    },
   };
 }
+
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -310,7 +595,7 @@ app.get("/api/jira/mock-tasks", (req, res) => {
 });
 
 app.get("/api/sync-gitlab", async (req, res) => {
-  const { taskKey, branch } = req.query;
+  const { taskKey, branch, projectId } = req.query;
 
   if (!taskKey) {
     return res.status(400).json({
@@ -329,31 +614,124 @@ app.get("/api/sync-gitlab", async (req, res) => {
   }
 
   try {
-    const projectId = getGitlabProjectId();
-    const commitParams = branch
-      ? { ref_name: branch, per_page: 20 }
-      : { search: taskKey, per_page: 20 };
+    const gitlab = getEffectiveGitlabConfig();
 
-    const resp = await axios.get(
-      `${process.env.GITLAB_URL}/api/v4/projects/${projectId}/repository/commits`,
-      {
-        headers: { "PRIVATE-TOKEN": process.env.GITLAB_TOKEN },
-        params: commitParams,
-      },
-    );
-
-    const commits = resp.data;
-
-    if (!commits || commits.length === 0) {
-      return res.json({
-        success: false,
-        description: branch
-          ? "کامیتی در این برنچ یافت نشد."
-          : "کامیتی برای این taskKey یافت نشد.",
-        durationMinutes: 0,
-      });
+    if (projectId) {
+      gitlab.projectId = String(projectId);
     }
 
+    async function findGitlabBranchesByTaskKey(gitlab, taskKey) {
+      const response = await axios.get(
+        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/branches`,
+        {
+          headers: { "PRIVATE-TOKEN": gitlab.token },
+          params: {
+            search: taskKey,
+            per_page: 20,
+          },
+        },
+      );
+
+      return Array.isArray(response.data) ? response.data : [];
+    }
+
+    async function getGitlabCommits(gitlab, params) {
+      const response = await axios.get(
+        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/commits`,
+        {
+          headers: { "PRIVATE-TOKEN": gitlab.token },
+          params,
+        },
+      );
+
+      return Array.isArray(response.data) ? response.data : [];
+    }
+
+    let commits = [];
+    let matchedBranchNames = [];
+
+    if (branch) {
+      commits = await getGitlabCommits(gitlab, {
+        ref_name: branch,
+        per_page: 20,
+      });
+
+      matchedBranchNames = [branch];
+
+      if (commits.length === 0) {
+        let matchedBranches = [];
+
+        for (const alias of getTaskKeySearchAliases(taskKey)) {
+          const branches = await findGitlabBranchesByTaskKey(gitlab, alias);
+          matchedBranches.push(...branches);
+        }
+
+        const seenBranchNames = new Set();
+        matchedBranches = matchedBranches.filter((branchItem) => {
+          if (!branchItem?.name || seenBranchNames.has(branchItem.name)) {
+            return false;
+          }
+
+          seenBranchNames.add(branchItem.name);
+          return true;
+        });
+
+        matchedBranchNames = matchedBranches.map((item) => item.name);
+
+        for (const matchedBranch of matchedBranches.slice(0, 3)) {
+          const branchCommits = await getGitlabCommits(gitlab, {
+            ref_name: matchedBranch.name,
+            per_page: 20,
+          });
+
+          commits.push(...branchCommits);
+        }
+      }
+    } else {
+      if (commits.length === 0) {
+        commits = await getGitlabCommits(gitlab, {
+          search: taskKey,
+          per_page: 20,
+        });
+      }
+
+      const seenCommitIds = new Set();
+
+      commits = commits.filter((commit) => {
+        if (!commit?.id || seenCommitIds.has(commit.id)) {
+          return false;
+        }
+
+        seenCommitIds.add(commit.id);
+        return true;
+      });
+      const escapedTaskKey = String(taskKey).replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&",
+      );
+      const taskKeyPattern = new RegExp(`\\[?${escapedTaskKey}\\]?`, "i");
+
+      const taskKeyCommits = commits.filter((commit) => {
+        const title = commit.title || "";
+        const message = commit.message || "";
+
+        return taskKeyPattern.test(title) || taskKeyPattern.test(message);
+      });
+
+      if (taskKeyCommits.length > 0) {
+        commits = taskKeyCommits;
+      }
+
+      if (!commits || commits.length === 0) {
+        return res.json({
+          success: false,
+          description: branch
+            ? "کامیتی در این برنچ یافت نشد."
+            : "کامیتی برای این taskKey یافت نشد.",
+          durationMinutes: 0,
+        });
+      }
+    }
     const prompt = [
       "از روی عنوان کامیت‌های زیر، یک گزارش کارکرد فارسی کامل اما خلاصه تولید کن.",
       "خروجی فقط شامل بولت پوینت باشد.",
@@ -400,6 +778,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
       evidence: {
         taskKey,
         branch: branch || undefined,
+        matchedBranches: matchedBranchNames,
         commitCount: commits.length,
         firstCommitAt: timeSuggestion.firstEvidenceAt,
         lastCommitAt: timeSuggestion.lastEvidenceAt,
@@ -438,49 +817,254 @@ app.get("/api/sync-gitlab", async (req, res) => {
   }
 });
 
-app.get("/api/jira/assigned-tasks", async (req, res) => {
-  if (isMockIntegrationMode()) {
-    const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+app.post("/api/integrations/configure/jira", (req, res) => {
+  const {
+    baseUrl,
+    email,
+    token,
+    authType = "bearer",
+    apiVersion = "2",
+    jql,
+  } = req.body ?? {};
 
-    return res.json(response);
+  if (!baseUrl || !email || !token) {
+    return res.status(400).json({
+      success: false,
+      error: "Jira baseUrl, email and token are required.",
+    });
+  }
+
+  runtimeIntegrationConfig.jira = {
+    baseUrl: trimTrailingSlash(baseUrl),
+    email,
+    token,
+    authType,
+    apiVersion,
+    jql:
+      jql ||
+      "assignee=currentUser() AND statusCategory != Done ORDER BY updated DESC",
+    mapping: null,
+  };
+  saveRuntimeIntegrationConfig();
+
+  return res.json({
+    success: true,
+    provider: "jira",
+    mode: getJiraMode(),
+    baseUrl: runtimeIntegrationConfig.jira.baseUrl,
+    maskedAccount: email,
+  });
+});
+
+app.post("/api/integrations/configure/gitlab", (req, res) => {
+  const {
+    baseUrl,
+    username = "",
+    token,
+    projectId,
+    branchPattern = "feature/{TASK_KEY}",
+  } = req.body ?? {};
+
+  if (!baseUrl || !token || !projectId) {
+    return res.status(400).json({
+      success: false,
+      error: "GitLab baseUrl, token and projectId are required.",
+    });
+  }
+
+  runtimeIntegrationConfig.gitlab = {
+    baseUrl: trimTrailingSlash(baseUrl),
+    username,
+    token,
+    projectId: String(projectId),
+    branchPattern,
+  };
+
+  saveRuntimeIntegrationConfig();
+
+  return res.json({
+    success: true,
+    provider: "gitlab",
+    mode: getGitlabMode(),
+    baseUrl: runtimeIntegrationConfig.gitlab.baseUrl,
+    username,
+    projectId: runtimeIntegrationConfig.gitlab.projectId,
+    token: maskValue(token),
+  });
+});
+
+app.post("/api/integrations/test/jira", async (req, res) => {
+  const config = req.body?.baseUrl
+    ? {
+        baseUrl: trimTrailingSlash(req.body.baseUrl),
+        email: req.body.email,
+        token: req.body.token,
+        authType: req.body.authType || "bearer",
+        apiVersion: req.body.apiVersion || "2",
+      }
+    : getEffectiveJiraConfig();
+
+  if (!config.baseUrl || !config.email || !config.token) {
+    return res.status(400).json({
+      success: false,
+      error: "Jira config is incomplete.",
+    });
   }
 
   try {
-    requireEnv(["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_JQL"]);
-    const jiraApiVersion = process.env.JIRA_API_VERSION || "3";
-
     const response = await axios.get(
-      `${process.env.JIRA_BASE_URL}/rest/api/${jiraApiVersion}/search`,
+      `${config.baseUrl}/rest/api/${config.apiVersion}/myself`,
+      buildJiraAxiosAuthConfig(config),
+    );
+
+    return res.json({
+      success: true,
+      provider: "jira",
+      account:
+        response.data?.displayName ||
+        response.data?.emailAddress ||
+        config.email,
+    });
+  } catch (err) {
+    return res.status(err.response?.status ?? 500).json({
+      success: false,
+      error: "Jira connection failed.",
+    });
+  }
+});
+
+app.post("/api/integrations/test/gitlab", async (req, res) => {
+  const config = req.body?.baseUrl
+    ? {
+        baseUrl: trimTrailingSlash(req.body.baseUrl),
+        username: req.body.username || "",
+        token: req.body.token,
+        projectId: String(req.body.projectId || "").trim(),
+      }
+    : getEffectiveGitlabConfig();
+
+  if (!config.baseUrl || !config.token || !config.projectId) {
+    return res.status(400).json({
+      success: false,
+      error: "GitLab baseUrl, token and projectId/projectPath are required.",
+    });
+  }
+
+  try {
+    const userResponse = await axios.get(`${config.baseUrl}/api/v4/user`, {
+      headers: { "PRIVATE-TOKEN": config.token },
+    });
+
+    const actualUsername = userResponse.data?.username || "";
+    const usernameWarning =
+      config.username && actualUsername && config.username !== actualUsername
+        ? `Token belongs to "${actualUsername}", not "${config.username}".`
+        : null;
+
+    await axios.get(
+      `${config.baseUrl}/api/v4/projects/${encodeURIComponent(config.projectId)}`,
       {
-        auth: {
-          username: process.env.JIRA_EMAIL,
-          password: process.env.JIRA_API_TOKEN,
-        },
+        headers: { "PRIVATE-TOKEN": config.token },
+      },
+    );
+
+    return res.json({
+      success: true,
+      provider: "gitlab",
+      account: actualUsername || userResponse.data?.name || "GitLab user",
+      usernameWarning,
+      projectId: config.projectId,
+    });
+  } catch (err) {
+    const providerStatus = err.response?.status ?? 500;
+    const safeStatus =
+      providerStatus === 401 || providerStatus === 403 ? 400 : 502;
+
+    console.error("GitLab connection test failed", {
+      providerStatus,
+      message: err.message,
+      providerMessage: err.response?.data,
+    });
+
+    return res.status(safeStatus).json({
+      success: false,
+      error:
+        providerStatus === 401 || providerStatus === 403
+          ? "GitLab token is invalid or does not have enough permissions."
+          : "GitLab connection failed.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              providerStatus,
+              message: err.message,
+              data: err.response?.data,
+            }
+          : undefined,
+    });
+  }
+});
+
+app.get("/api/jira/assigned-tasks", async (req, res) => {
+  const jira = getEffectiveJiraConfig();
+
+  if (!isJiraConfigured()) {
+    if (isMockIntegrationMode()) {
+      const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+      return res.json(response);
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: "Jira is not configured.",
+    });
+  }
+
+  try {
+    const response = await axios.get(
+      `${jira.baseUrl}/rest/api/${jira.apiVersion}/search`,
+      {
+        ...buildJiraAxiosAuthConfig(jira),
         params: {
-          jql: process.env.JIRA_JQL,
-          maxResults: 20,
-          fields: "summary,status,issuetype,updated",
+          jql: jira.jql,
+          maxResults: 50,
+          fields: getConfiguredJiraSearchFields(),
         },
       },
     );
 
     return res.json(
-      (response.data.issues ?? []).map(mapJiraIssueToExternalTask),
+      (response.data.issues ?? []).map((issue) =>
+        mapJiraIssueToExternalTask(issue, jira.mapping),
+      ),
     );
   } catch (err) {
+    const status = err.response?.status ?? err.statusCode ?? 500;
+    const providerMessage =
+      err.response?.data?.errorMessages?.join(" | ") ||
+      err.response?.data?.message ||
+      err.message;
+
     console.error("Jira assigned tasks failed", {
-      status: err.response?.status,
+      status,
       message: err.message,
-      providerMessage: err.response?.data,
+      providerMessage,
+      data: err.response?.data,
     });
 
-    return res.status(err.statusCode ?? 500).json({
+    return res.status(status).json({
       success: false,
       error: "Jira assigned tasks failed. Check proxy configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              providerMessage,
+              data: err.response?.data,
+            }
+          : undefined,
     });
   }
 });
-
 function reportPurposeInstruction(purpose) {
   switch (purpose) {
     case "daily":
