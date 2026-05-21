@@ -3,8 +3,10 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const { SocksProxyAgent } = require("socks-proxy-agent");
-
 const app = express();
+const fs = require("fs");
+const path = require("path");
+const RUNTIME_CONFIG_FILE = path.join(__dirname, ".runtime-integrations.json");
 
 const PORT = Number(process.env.PORT ?? 3000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:4200";
@@ -18,6 +20,33 @@ app.use(express.json());
 const proxyAgent = USE_SOCKS_PROXY
   ? new SocksProxyAgent(SOCKS_PROXY_URL)
   : undefined;
+
+function loadRuntimeIntegrationConfig() {
+  try {
+    if (!fs.existsSync(RUNTIME_CONFIG_FILE)) {
+      return { jira: null, gitlab: null };
+    }
+
+    return JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, "utf8"));
+  } catch (error) {
+    console.warn("Could not load runtime integration config", error.message);
+    return { jira: null, gitlab: null };
+  }
+}
+const runtimeIntegrationConfig = loadRuntimeIntegrationConfig();
+
+function buildGeminiRequestConfig(timeout = 45000) {
+  return {
+    timeout,
+    ...(proxyAgent
+      ? {
+          httpAgent: proxyAgent,
+          httpsAgent: proxyAgent,
+          proxy: false,
+        }
+      : {}),
+  };
+}
 
 const wttMappings = {
   redesign: { project_id: 22, service_id: 1, contract_id: 1 }, // 22 = WTT
@@ -46,8 +75,8 @@ const mockJiraIssues = [
   },
 ];
 
-function getMissingEnv(keys) {
-  return keys.filter((key) => !process.env[key]);
+function getGitlabProjectId() {
+  return process.env.GITLAB_PROJECT_ID || process.env.PROJECT_ID;
 }
 
 const WORK_SESSION_GAP_LIMIT_MINUTES = 90;
@@ -64,6 +93,92 @@ function toMinutesBetween(start, end) {
 function toTimeHHMM(dateValue) {
   const date = new Date(dateValue);
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function trimTrailingSlash(value) {
+  return String(value ?? "").replace(/\/+$/, "");
+}
+
+function maskValue(value) {
+  if (!value) return null;
+  const text = String(value);
+  if (text.length <= 6) return "******";
+  return `${text.slice(0, 3)}***${text.slice(-3)}`;
+}
+
+function saveRuntimeIntegrationConfig() {
+  fs.writeFileSync(
+    RUNTIME_CONFIG_FILE,
+    JSON.stringify(runtimeIntegrationConfig, null, 2),
+    "utf8",
+  );
+}
+
+function getRuntimeJiraConfig() {
+  return runtimeIntegrationConfig.jira;
+}
+
+function getEffectiveJiraConfig() {
+  const runtime = getRuntimeJiraConfig();
+
+  return {
+    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.JIRA_BASE_URL),
+    email: runtime?.email || process.env.JIRA_EMAIL,
+    token: runtime?.token || process.env.JIRA_API_TOKEN,
+    authType: runtime?.authType || process.env.JIRA_AUTH_TYPE || "bearer",
+    apiVersion: runtime?.apiVersion || process.env.JIRA_API_VERSION || "2",
+    jql:
+      runtime?.jql ||
+      process.env.JIRA_JQL ||
+      "statusCategory != Done ORDER BY updated DESC",
+    mapping: runtime?.mapping || null,
+  };
+}
+
+function getRuntimeGitlabConfig() {
+  return runtimeIntegrationConfig.gitlab;
+}
+
+function getEffectiveGitlabConfig() {
+  const runtime = getRuntimeGitlabConfig();
+
+  return {
+    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.GITLAB_URL),
+    username: runtime?.username || process.env.GITLAB_USERNAME || "",
+    token: runtime?.token || process.env.GITLAB_TOKEN,
+    projectId:
+      runtime?.projectId ||
+      process.env.GITLAB_PROJECT_ID ||
+      process.env.PROJECT_ID,
+    branchPattern: runtime?.branchPattern || "feature/{TASK_KEY}",
+  };
+}
+
+function buildJiraAxiosAuthConfig(config) {
+  if (config.authType === "bearer") {
+    return {
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+      },
+    };
+  }
+
+  return {
+    auth: {
+      username: config.email,
+      password: config.token,
+    },
+  };
+}
+
+function isJiraConfigured() {
+  const jira = getEffectiveJiraConfig();
+  return Boolean(jira.baseUrl && jira.email && jira.token);
+}
+
+function isGitlabConfigured() {
+  const gitlab = getEffectiveGitlabConfig();
+  return Boolean(gitlab.baseUrl && gitlab.token && gitlab.projectId);
 }
 
 function calculateEvidenceTimeSuggestion(commits) {
@@ -115,7 +230,6 @@ function calculateEvidenceTimeSuggestion(commits) {
   );
 
   const firstCommitAt = sortedCommits[0].created_at;
-  const rawLastCommitAt = sortedCommits[sortedCommits.length - 1].created_at;
   const suggestedEndAt = new Date(
     new Date(firstCommitAt).getTime() + suggestedDurationMinutes * 60000,
   ).toISOString();
@@ -149,22 +263,91 @@ function calculateEvidenceTimeSuggestion(commits) {
   };
 }
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "wtt-proxy",
-    jiraMode: "mock",
-    gitProvider: process.env.GITLAB_URL
-      ? "gitlab-compatible"
-      : "not-configured",
-    aiProvider: process.env.GEMINI_MODEL
-      ? "gemini-compatible"
-      : "not-configured",
-  });
-});
+function isMockIntegrationMode() {
+  return process.env.ENABLE_INTEGRATION_MOCK_MODE !== "false";
+}
 
-app.get("/api/jira/mock-tasks", (req, res) => {
-  const response = mockJiraIssues.map((issue) => ({
+function getRequiredEnvMissing(keys) {
+  return keys.filter((key) => !process.env[key]);
+}
+
+function getAiMissingEnv() {
+  return getRequiredEnvMissing(["GEMINI_API_KEY", "GEMINI_MODEL"]);
+}
+
+function getJiraMissingEnv() {
+  const jira = getEffectiveJiraConfig();
+  const missing = [];
+
+  if (!jira.baseUrl) missing.push("JIRA_BASE_URL");
+  if (!jira.email) missing.push("JIRA_EMAIL");
+  if (!jira.token) missing.push("JIRA_API_TOKEN");
+
+  return missing;
+}
+
+function getGitlabMissingEnv() {
+  const gitlab = getEffectiveGitlabConfig();
+  const missing = [];
+
+  if (!gitlab.baseUrl) missing.push("GITLAB_URL");
+  if (!gitlab.token) missing.push("GITLAB_TOKEN");
+  if (!gitlab.projectId) missing.push("GITLAB_PROJECT_ID");
+
+  return missing;
+}
+
+function getJiraMode() {
+  if (isJiraConfigured()) return "real";
+  if (isMockIntegrationMode()) return "mock";
+  return "not-configured";
+}
+
+function getGitlabMode() {
+  return isGitlabConfigured() ? "real" : "not-configured";
+}
+
+function getAiMode() {
+  return getAiMissingEnv().length === 0 ? "real" : "not-configured";
+}
+
+function getIntegrationMissingEnv() {
+  const missing = [];
+
+  if (!isMockIntegrationMode()) {
+    missing.push(...getJiraMissingEnv());
+  }
+
+  missing.push(...getGitlabMissingEnv(), ...getAiMissingEnv());
+
+  return [...new Set(missing)];
+}
+
+function requireEnv(keys) {
+  const missing = keys.filter((key) => !process.env[key]);
+  if (missing.length > 0) {
+    const error = new Error(`Missing env: ${missing.join(", ")}`);
+    error.statusCode = 500;
+    throw error;
+  }
+  return true;
+}
+
+function requireGitlabAndAiEnv() {
+  const missing = [...getGitlabMissingEnv(), ...getAiMissingEnv()];
+
+  if (missing.length > 0) {
+    const error = new Error(`Missing env: ${missing.join(", ")}`);
+    error.statusCode = 500;
+    error.missingEnv = missing;
+    throw error;
+  }
+
+  return true;
+}
+
+function mapMockJiraIssueToExternalTask(issue) {
+  return {
     id: issue.key,
     key: issue.key,
     title: issue.title,
@@ -173,72 +356,412 @@ app.get("/api/jira/mock-tasks", (req, res) => {
     contract_id: issue.mapping.contract_id,
     branch_name: issue.branch,
     source: "mock-jira",
-  }));
+  };
+}
+function jiraFieldToPlainText(value) {
+  if (!value) return "";
+
+  if (typeof value === "string") return value;
+
+  if (Array.isArray(value)) {
+    return value.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+  }
+
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.value === "string") return value.value;
+    if (typeof value.name === "string") return value.name;
+
+    if (Array.isArray(value.content)) {
+      return value.content.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+    }
+  }
+
+  return "";
+}
+
+function parseWttMetadataBlock(text) {
+  const source = String(text ?? "");
+  const match = source.match(/WTT:?\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const lines = match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const data = {};
+
+  for (const line of lines) {
+    const [rawKey, ...rawValueParts] = line.split("=");
+    const key = rawKey?.trim();
+    const value = rawValueParts.join("=").trim();
+
+    if (key && value) {
+      data[key] = value;
+    }
+  }
+
+  return {
+    project_id: data.project_id ? Number(data.project_id) : null,
+    service_id: data.service_id ? Number(data.service_id) : null,
+    contract_id: data.contract_id ? Number(data.contract_id) : null,
+    location: data.location || null,
+    gitlab_project: data.gitlab_project || null,
+    branch_name: data.branch_name || null,
+    branch_pattern: data.branch_pattern || null,
+    mapping_source: "jira-description",
+  };
+}
+
+function readCustomField(issue, envName) {
+  const fieldId = process.env[envName];
+
+  if (!fieldId) {
+    return null;
+  }
+
+  return jiraFieldToPlainText(issue.fields?.[fieldId]).trim() || null;
+}
+
+function getTaskKeySearchAliases(taskKey) {
+  const key = String(taskKey ?? "").trim();
+  const numberPart = key.split("-")[1];
+
+  return [
+    key,
+    key.toLowerCase(),
+    numberPart ? `issue-${numberPart}` : "",
+    numberPart ? `bugfix/issue-${numberPart}` : "",
+    numberPart ? `feature/${key}` : "",
+  ].filter(Boolean);
+}
+
+function extractWttMetadataFromCustomFields(issue) {
+  const projectId = readCustomField(issue, "JIRA_WTT_PROJECT_FIELD");
+  const serviceId = readCustomField(issue, "JIRA_WTT_SERVICE_FIELD");
+  const contractId = readCustomField(issue, "JIRA_WTT_CONTRACT_FIELD");
+  const location = readCustomField(issue, "JIRA_WTT_LOCATION_FIELD");
+  const gitlabProject = readCustomField(issue, "JIRA_GITLAB_PROJECT_FIELD");
+  const branchPattern = readCustomField(issue, "JIRA_BRANCH_PATTERN_FIELD");
+
+  if (
+    !projectId &&
+    !serviceId &&
+    !contractId &&
+    !location &&
+    !gitlabProject &&
+    !branchPattern
+  ) {
+    return null;
+  }
+
+  return {
+    project_id: projectId ? Number(projectId) : null,
+    service_id: serviceId ? Number(serviceId) : null,
+    contract_id: contractId ? Number(contractId) : null,
+    location: location || null,
+    gitlab_project: gitlabProject || null,
+    branch_pattern: branchPattern || null,
+    mapping_source: "jira-custom-fields",
+  };
+}
+
+function extractWttMetadataFromJiraIssue(issue) {
+  const descriptionText = jiraFieldToPlainText(issue.fields?.description);
+  const fromDescription = parseWttMetadataBlock(descriptionText);
+
+  if (fromDescription) {
+    return fromDescription;
+  }
+
+  return extractWttMetadataFromCustomFields(issue);
+}
+
+function getConfiguredJiraSearchFields() {
+  const baseFields = [
+    "summary",
+    "status",
+    "issuetype",
+    "updated",
+    "description",
+    "project",
+    "assignee",
+    "labels",
+    "components",
+  ];
+
+  const customFields = [
+    process.env.JIRA_WTT_PROJECT_FIELD,
+    process.env.JIRA_WTT_SERVICE_FIELD,
+    process.env.JIRA_WTT_CONTRACT_FIELD,
+    process.env.JIRA_WTT_LOCATION_FIELD,
+    process.env.JIRA_GITLAB_PROJECT_FIELD,
+    process.env.JIRA_BRANCH_PATTERN_FIELD,
+  ].filter(Boolean);
+
+  return [...new Set([...baseFields, ...customFields])].join(",");
+}
+
+function buildBranchNameFromPattern(pattern, key) {
+  if (!pattern) return `feature/${key}`;
+  return pattern.replaceAll("{TASK_KEY}", key);
+}
+
+function mapJiraIssueToExternalTask(issue, runtimeMapping) {
+  const key = issue.key;
+  const summary = issue.fields?.summary ?? key;
+  const wttMetadata = extractWttMetadataFromJiraIssue(issue);
+
+  const mapping = runtimeMapping
+    ? {
+        project_id: runtimeMapping.project_id,
+        service_id: runtimeMapping.service_id,
+        contract_id: runtimeMapping.contract_id,
+        mapping_source: "runtime",
+      }
+    : wttMetadata;
+
+  const branchPattern = wttMetadata?.branch_pattern || "feature/{TASK_KEY}";
+  const branchName =
+    wttMetadata?.branch_name || buildBranchNameFromPattern(branchPattern, key);
+
+  return {
+    id: key,
+    key,
+    title: summary,
+
+    project_id: mapping?.project_id ?? null,
+    service_id: mapping?.service_id ?? null,
+    contract_id: mapping?.contract_id ?? null,
+    location: wttMetadata?.location ?? null,
+
+    gitlab_project_id: wttMetadata?.gitlab_project ?? null,
+    branch_pattern: branchPattern,
+    branch_name: branchName,
+    mapping_source: mapping?.mapping_source ?? null,
+
+    status: issue.fields?.status?.name,
+    source: "jira",
+    raw: {
+      updated: issue.fields?.updated,
+      issueType: issue.fields?.issuetype?.name,
+      jiraProjectKey: issue.fields?.project?.key,
+      jiraProjectName: issue.fields?.project?.name,
+      assignee: issue.fields?.assignee?.displayName,
+      labels: issue.fields?.labels ?? [],
+      components: issue.fields?.components ?? [],
+      descriptionText: jiraFieldToPlainText(issue.fields?.description),
+      wttMetadata,
+    },
+  };
+}
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "wtt-proxy",
+    jiraMode: getJiraMode(),
+    gitProvider:
+      getGitlabMode() === "real" ? "gitlab-compatible" : "not-configured",
+    aiProvider: getAiMode() === "real" ? "gemini-compatible" : "not-configured",
+  });
+});
+
+app.get("/api/integrations/status", (req, res) => {
+  res.json({
+    ok: true,
+    jira: {
+      mode: getJiraMode(),
+    },
+    gitlab: {
+      mode: getGitlabMode(),
+    },
+    ai: {
+      mode: getAiMode(),
+    },
+    missingEnv: getIntegrationMissingEnv(),
+  });
+});
+
+// Legacy manual-testing route. This always returns mock tasks regardless of mock-mode env.
+app.get("/api/jira/mock-tasks", (req, res) => {
+  const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
 
   res.json(response);
 });
 
 app.get("/api/sync-gitlab", async (req, res) => {
-  const { taskKey, branch } = req.query;
+  const { taskKey, branch, projectId } = req.query;
 
-  if (!taskKey || !branch) {
+  if (!taskKey) {
     return res.status(400).json({
       success: false,
-      error: "taskKey and branch are required.",
-    });
-  }
-
-  const missingEnv = getMissingEnv([
-    "GITLAB_URL",
-    "PROJECT_ID",
-    "GITLAB_TOKEN",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
-  ]);
-
-  if (missingEnv.length > 0) {
-    return res.status(500).json({
-      success: false,
-      error: `Proxy configuration is incomplete: ${missingEnv.join(", ")}`,
+      error: "taskKey is required.",
     });
   }
 
   try {
-    const resp = await axios.get(
-      `${process.env.GITLAB_URL}/api/v4/projects/${process.env.PROJECT_ID}/repository/commits`,
-      {
-        headers: { "PRIVATE-TOKEN": process.env.GITLAB_TOKEN },
-        params: { ref_name: branch, per_page: 20 },
-      },
-    );
+    requireGitlabAndAiEnv();
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: `Proxy configuration is incomplete: ${err.missingEnv.join(", ")}`,
+    });
+  }
 
-    const commits = resp.data;
+  try {
+    const gitlab = getEffectiveGitlabConfig();
 
-    if (!commits || commits.length === 0) {
-      return res.json({
-        success: false,
-        description: "کامیتی در این برنچ یافت نشد.",
-        durationMinutes: 0,
-      });
+    if (projectId) {
+      gitlab.projectId = String(projectId);
     }
 
+    async function findGitlabBranchesByTaskKey(gitlab, taskKey) {
+      const response = await axios.get(
+        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/branches`,
+        {
+          headers: { "PRIVATE-TOKEN": gitlab.token },
+          params: {
+            search: taskKey,
+            per_page: 20,
+          },
+        },
+      );
+
+      return Array.isArray(response.data) ? response.data : [];
+    }
+
+    async function getGitlabCommits(gitlab, params) {
+      const response = await axios.get(
+        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/commits`,
+        {
+          headers: { "PRIVATE-TOKEN": gitlab.token },
+          params,
+        },
+      );
+
+      return Array.isArray(response.data) ? response.data : [];
+    }
+
+    let commits = [];
+    let matchedBranchNames = [];
+
+    if (branch) {
+      commits = await getGitlabCommits(gitlab, {
+        ref_name: branch,
+        per_page: 20,
+      });
+
+      matchedBranchNames = [branch];
+
+      if (commits.length === 0) {
+        let matchedBranches = [];
+
+        for (const alias of getTaskKeySearchAliases(taskKey)) {
+          const branches = await findGitlabBranchesByTaskKey(gitlab, alias);
+          matchedBranches.push(...branches);
+        }
+
+        const seenBranchNames = new Set();
+        matchedBranches = matchedBranches.filter((branchItem) => {
+          if (!branchItem?.name || seenBranchNames.has(branchItem.name)) {
+            return false;
+          }
+
+          seenBranchNames.add(branchItem.name);
+          return true;
+        });
+
+        matchedBranchNames = matchedBranches.map((item) => item.name);
+
+        for (const matchedBranch of matchedBranches.slice(0, 3)) {
+          const branchCommits = await getGitlabCommits(gitlab, {
+            ref_name: matchedBranch.name,
+            per_page: 20,
+          });
+
+          commits.push(...branchCommits);
+        }
+      }
+    } else {
+      if (commits.length === 0) {
+        commits = await getGitlabCommits(gitlab, {
+          search: taskKey,
+          per_page: 20,
+        });
+      }
+
+      const seenCommitIds = new Set();
+
+      commits = commits.filter((commit) => {
+        if (!commit?.id || seenCommitIds.has(commit.id)) {
+          return false;
+        }
+
+        seenCommitIds.add(commit.id);
+        return true;
+      });
+      const escapedTaskKey = String(taskKey).replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&",
+      );
+      const taskKeyPattern = new RegExp(`\\[?${escapedTaskKey}\\]?`, "i");
+
+      const taskKeyCommits = commits.filter((commit) => {
+        const title = commit.title || "";
+        const message = commit.message || "";
+
+        return taskKeyPattern.test(title) || taskKeyPattern.test(message);
+      });
+
+      if (taskKeyCommits.length > 0) {
+        commits = taskKeyCommits;
+      }
+
+      if (!commits || commits.length === 0) {
+        return res.json({
+          success: false,
+          description: branch
+            ? "کامیتی در این برنچ یافت نشد."
+            : "کامیتی برای این taskKey یافت نشد.",
+          durationMinutes: 0,
+        });
+      }
+    }
     const prompt = [
       "از روی عنوان کامیت‌های زیر، یک گزارش کارکرد فارسی کامل اما خلاصه تولید کن.",
       "خروجی فقط شامل بولت پوینت باشد.",
       "قطعیت بیش از حد نده؛ متن باید به عنوان پیش‌نویس قابل بررسی توسط برنامه‌نویس باشد.",
       "",
       `Task: ${taskKey}`,
-      `Branch: ${branch}`,
+      `Branch: ${branch || "not provided; searched commits by task key"}`,
       "",
       "Commits:",
       commits.map((c) => `- ${c.title}`).join("\n"),
     ].join("\n");
 
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+    console.log("GitLab AI sync request started", {
+      model: process.env.GEMINI_MODEL,
+      promptLength: prompt.length,
+      commitCount: commits.length,
+      useSocksProxy: USE_SOCKS_PROXY,
+    });
+
     const aiResp = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents: [{ parts: [{ text: prompt }] }] },
-      proxyAgent ? { httpsAgent: proxyAgent } : undefined,
+      buildGeminiRequestConfig(45000),
     );
+
+    console.log("AI Report request finished", {
+      status: aiResp.status,
+    });
 
     const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
 
@@ -254,7 +777,8 @@ app.get("/api/sync-gitlab", async (req, res) => {
       confidenceLabel: timeSuggestion.confidenceLabel,
       evidence: {
         taskKey,
-        branch,
+        branch: branch || undefined,
+        matchedBranches: matchedBranchNames,
         commitCount: commits.length,
         firstCommitAt: timeSuggestion.firstEvidenceAt,
         lastCommitAt: timeSuggestion.lastEvidenceAt,
@@ -264,23 +788,452 @@ app.get("/api/sync-gitlab", async (req, res) => {
     });
   } catch (err) {
     const status = err.response?.status ?? 500;
+    const providerMessage =
+      err.code === "ECONNABORTED"
+        ? "AI provider request timed out after 45 seconds."
+        : (err.response?.data?.error?.message ??
+          err.response?.data?.message ??
+          err.message);
 
-    console.error("Sync failed", {
+    console.error("AI Report Gen failed", {
       status,
+      code: err.code,
       message: err.message,
-      providerMessage:
-        err.response?.data?.message ?? err.response?.data?.error?.message,
+      providerMessage,
     });
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      error:
-        "GitLab/AI sync failed. Check proxy logs and local environment configuration.",
+      error: "AI Summary generation failed. Check proxy and AI configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              code: err.code,
+              providerMessage,
+            }
+          : undefined,
     });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Proxy up on ${PORT}`);
+app.post("/api/integrations/configure/jira", (req, res) => {
+  const {
+    baseUrl,
+    email,
+    token,
+    authType = "bearer",
+    apiVersion = "2",
+    jql,
+  } = req.body ?? {};
+
+  if (!baseUrl || !email || !token) {
+    return res.status(400).json({
+      success: false,
+      error: "Jira baseUrl, email and token are required.",
+    });
+  }
+
+  runtimeIntegrationConfig.jira = {
+    baseUrl: trimTrailingSlash(baseUrl),
+    email,
+    token,
+    authType,
+    apiVersion,
+    jql:
+      jql ||
+      "assignee=currentUser() AND statusCategory != Done ORDER BY updated DESC",
+    mapping: null,
+  };
+  saveRuntimeIntegrationConfig();
+
+  return res.json({
+    success: true,
+    provider: "jira",
+    mode: getJiraMode(),
+    baseUrl: runtimeIntegrationConfig.jira.baseUrl,
+    maskedAccount: email,
+  });
+});
+
+app.post("/api/integrations/configure/gitlab", (req, res) => {
+  const {
+    baseUrl,
+    username = "",
+    token,
+    projectId,
+    branchPattern = "feature/{TASK_KEY}",
+  } = req.body ?? {};
+
+  if (!baseUrl || !token || !projectId) {
+    return res.status(400).json({
+      success: false,
+      error: "GitLab baseUrl, token and projectId are required.",
+    });
+  }
+
+  runtimeIntegrationConfig.gitlab = {
+    baseUrl: trimTrailingSlash(baseUrl),
+    username,
+    token,
+    projectId: String(projectId),
+    branchPattern,
+  };
+
+  saveRuntimeIntegrationConfig();
+
+  return res.json({
+    success: true,
+    provider: "gitlab",
+    mode: getGitlabMode(),
+    baseUrl: runtimeIntegrationConfig.gitlab.baseUrl,
+    username,
+    projectId: runtimeIntegrationConfig.gitlab.projectId,
+    token: maskValue(token),
+  });
+});
+
+app.post("/api/integrations/test/jira", async (req, res) => {
+  const config = req.body?.baseUrl
+    ? {
+        baseUrl: trimTrailingSlash(req.body.baseUrl),
+        email: req.body.email,
+        token: req.body.token,
+        authType: req.body.authType || "bearer",
+        apiVersion: req.body.apiVersion || "2",
+      }
+    : getEffectiveJiraConfig();
+
+  if (!config.baseUrl || !config.email || !config.token) {
+    return res.status(400).json({
+      success: false,
+      error: "Jira config is incomplete.",
+    });
+  }
+
+  try {
+    const response = await axios.get(
+      `${config.baseUrl}/rest/api/${config.apiVersion}/myself`,
+      buildJiraAxiosAuthConfig(config),
+    );
+
+    return res.json({
+      success: true,
+      provider: "jira",
+      account:
+        response.data?.displayName ||
+        response.data?.emailAddress ||
+        config.email,
+    });
+  } catch (err) {
+    return res.status(err.response?.status ?? 500).json({
+      success: false,
+      error: "Jira connection failed.",
+    });
+  }
+});
+
+app.post("/api/integrations/test/gitlab", async (req, res) => {
+  const config = req.body?.baseUrl
+    ? {
+        baseUrl: trimTrailingSlash(req.body.baseUrl),
+        username: req.body.username || "",
+        token: req.body.token,
+        projectId: String(req.body.projectId || "").trim(),
+      }
+    : getEffectiveGitlabConfig();
+
+  if (!config.baseUrl || !config.token || !config.projectId) {
+    return res.status(400).json({
+      success: false,
+      error: "GitLab baseUrl, token and projectId/projectPath are required.",
+    });
+  }
+
+  try {
+    const userResponse = await axios.get(`${config.baseUrl}/api/v4/user`, {
+      headers: { "PRIVATE-TOKEN": config.token },
+    });
+
+    const actualUsername = userResponse.data?.username || "";
+    const usernameWarning =
+      config.username && actualUsername && config.username !== actualUsername
+        ? `Token belongs to "${actualUsername}", not "${config.username}".`
+        : null;
+
+    await axios.get(
+      `${config.baseUrl}/api/v4/projects/${encodeURIComponent(config.projectId)}`,
+      {
+        headers: { "PRIVATE-TOKEN": config.token },
+      },
+    );
+
+    return res.json({
+      success: true,
+      provider: "gitlab",
+      account: actualUsername || userResponse.data?.name || "GitLab user",
+      usernameWarning,
+      projectId: config.projectId,
+    });
+  } catch (err) {
+    const providerStatus = err.response?.status ?? 500;
+    const safeStatus =
+      providerStatus === 401 || providerStatus === 403 ? 400 : 502;
+
+    console.error("GitLab connection test failed", {
+      providerStatus,
+      message: err.message,
+      providerMessage: err.response?.data,
+    });
+
+    return res.status(safeStatus).json({
+      success: false,
+      error:
+        providerStatus === 401 || providerStatus === 403
+          ? "GitLab token is invalid or does not have enough permissions."
+          : "GitLab connection failed.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              providerStatus,
+              message: err.message,
+              data: err.response?.data,
+            }
+          : undefined,
+    });
+  }
+});
+
+app.get("/api/jira/assigned-tasks", async (req, res) => {
+  const jira = getEffectiveJiraConfig();
+
+  if (!isJiraConfigured()) {
+    if (isMockIntegrationMode()) {
+      const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+      return res.json(response);
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: "Jira is not configured.",
+    });
+  }
+
+  try {
+    const response = await axios.get(
+      `${jira.baseUrl}/rest/api/${jira.apiVersion}/search`,
+      {
+        ...buildJiraAxiosAuthConfig(jira),
+        params: {
+          jql: jira.jql,
+          maxResults: 50,
+          fields: getConfiguredJiraSearchFields(),
+        },
+      },
+    );
+
+    return res.json(
+      (response.data.issues ?? []).map((issue) =>
+        mapJiraIssueToExternalTask(issue, jira.mapping),
+      ),
+    );
+  } catch (err) {
+    const status = err.response?.status ?? err.statusCode ?? 500;
+    const providerMessage =
+      err.response?.data?.errorMessages?.join(" | ") ||
+      err.response?.data?.message ||
+      err.message;
+
+    console.error("Jira assigned tasks failed", {
+      status,
+      message: err.message,
+      providerMessage,
+      data: err.response?.data,
+    });
+
+    return res.status(status).json({
+      success: false,
+      error: "Jira assigned tasks failed. Check proxy configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              providerMessage,
+              data: err.response?.data,
+            }
+          : undefined,
+    });
+  }
+});
+function reportPurposeInstruction(purpose) {
+  switch (purpose) {
+    case "daily":
+      return "هدف گزارش: ارائه دیلی خیلی کوتاه. خروجی باید نهایتاً ۵ بولت کوتاه باشد و روی کارهای انجام‌شده تمرکز کند.";
+    case "lead":
+      return "هدف گزارش: ارائه به لید فنی. خروجی باید شامل کارهای انجام‌شده، ریسک‌ها، وابستگی‌ها و قدم بعدی باشد.";
+    case "self_review":
+      return "هدف گزارش: ارزیابی شخصی. خروجی باید نقاط قوت، کمبودها، تمرکز زمانی و پیشنهاد بهبود فردی را بگوید.";
+    case "managerial":
+      return "هدف گزارش: گزارش مدیریتی. خروجی باید رسمی، خلاصه، نتیجه‌محور و قابل ارائه به مدیر باشد.";
+    default:
+      return "هدف گزارش: خلاصه عملکرد کاری.";
+  }
+}
+
+function truncateText(value, maxLength = 240) {
+  return String(value ?? "").slice(0, maxLength);
+}
+
+app.post("/api/reports/ai-summary", async (req, res) => {
+  const missingAiEnv = getAiMissingEnv();
+
+  if (missingAiEnv.length > 0) {
+    return res.status(500).json({
+      success: false,
+      error: `AI configuration is incomplete: ${missingAiEnv.join(", ")}`,
+    });
+  }
+
+  const {
+    rangeLabel = "",
+    purpose = "daily",
+    tone = "managerial",
+    detailLevel = "balanced",
+    language = "fa",
+    attendanceSummary = {},
+    topActivities = [],
+    tasks = [],
+  } = req.body ?? {};
+
+  const safeTopActivities = Array.isArray(topActivities)
+    ? topActivities.slice(0, 8)
+    : [];
+
+  const safeTasks = Array.isArray(tasks)
+    ? tasks.slice(0, 20).map((task) => ({
+        id: task.id,
+        title: truncateText(task.title, 160),
+        projectTitle: truncateText(task.projectTitle, 80),
+        date: truncateText(task.date, 32),
+        durationMinutes: Number(task.durationMinutes ?? 0),
+        status: truncateText(task.status, 40),
+        description: truncateText(task.description, 260),
+      }))
+    : [];
+
+  const promptLines = [
+    "شما یک دستیار هوش مصنوعی برای تولید گزارش عملکرد پرسنل هستید.",
+    "بر اساس داده‌های واقعی WTT، یک گزارش فارسی حرفه‌ای و قابل بازبینی تولید کن.",
+    "بدون ادعای قطعی و بدون ساختن داده جدید بنویس؛ فقط از داده‌های داده‌شده استفاده کن.",
+    `لحن گزارش: ${tone}`,
+    `سطح جزئیات: ${detailLevel}`,
+    `زبان خروجی: ${language}`,
+    reportPurposeInstruction(purpose),
+    "",
+    `بازه زمانی: ${rangeLabel}`,
+    "خلاصه حضور و غیاب:",
+    `- مجموع حضور: ${attendanceSummary.presenceMinutes ?? 0} دقیقه`,
+    `- کل کارکرد: ${attendanceSummary.totalWorkMinutes ?? 0} دقیقه`,
+    `- کارکرد مورد انتظار: ${attendanceSummary.expectedMinutes ?? 0} دقیقه`,
+    `- اضافه‌کار/کسرکار: ${attendanceSummary.overtimeMinutes ?? 0} دقیقه`,
+    `- راندمان میانگین: ${attendanceSummary.averageEfficiency ?? 0}%`,
+    `- روزهای دارای تسک: ${attendanceSummary.taskDays ?? 0} روز`,
+    `- تعداد ناهار: ${attendanceSummary.lunches ?? 0}`,
+    `- روزهای بدون کارکرد: ${attendanceSummary.noWorkDays ?? 0} روز`,
+    `- مرخصی تاییدشده: ${attendanceSummary.acceptedVacations ?? 0}`,
+    `- ماموریت تاییدشده: ${attendanceSummary.acceptedMissions ?? 0}`,
+    "",
+    "عمده فعالیت‌ها:",
+  ];
+
+  safeTopActivities.forEach((act) => {
+    promptLines.push(
+      `- پروژه ${truncateText(act.projectName, 80)} (${truncateText(act.serviceName, 80)}): ${Number(act.spentMinutes ?? 0)} دقیقه (${truncateText(act.percentageText, 24)})`,
+    );
+  });
+
+  promptLines.push("", "تسک‌های ثبت‌شده در این بازه:");
+
+  safeTasks.forEach((task) => {
+    promptLines.push(
+      `- [${task.id}] ${task.title} | پروژه: ${task.projectTitle} | تاریخ: ${task.date} | مدت: ${task.durationMinutes} دقیقه | وضعیت: ${task.status} | توضیح: ${task.description || "بدون توضیح"}`,
+    );
+  });
+
+  promptLines.push(
+    "",
+    "خروجی را منظم، خوانا و آماده ارائه بنویس. اگر هدف daily است خیلی کوتاه بنویس. اگر هدف lead است، ریسک‌ها و قدم بعدی را هم اضافه کن. اگر هدف self_review است، پیشنهاد بهبود فردی بده.",
+  );
+
+  const prompt = promptLines.join("\n");
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+  console.log("AI Report request started", {
+    model: process.env.GEMINI_MODEL,
+    promptLength: prompt.length,
+    taskCount: safeTasks.length,
+    topActivityCount: safeTopActivities.length,
+    useSocksProxy: USE_SOCKS_PROXY,
+  });
+
+  try {
+    const aiResp = await axios.post(
+      geminiUrl,
+      {
+        contents: [
+          {
+            parts: [{ text: prompt }],
+          },
+        ],
+      },
+      buildGeminiRequestConfig(45000),
+    );
+    console.log("AI Report request finished", {
+      status: aiResp.status,
+    });
+
+    const generatedText =
+      aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+    return res.json({
+      success: true,
+      summary: generatedText,
+      model: process.env.GEMINI_MODEL,
+    });
+  } catch (err) {
+    const status = err.response?.status ?? 500;
+    const providerMessage =
+      err.code === "ECONNABORTED"
+        ? "AI provider request timed out after 45 seconds."
+        : (err.response?.data?.error?.message ??
+          err.response?.data?.message ??
+          err.message);
+
+    console.error("AI Report Gen failed", {
+      status,
+      code: err.code,
+      message: err.message,
+      providerMessage,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: "AI Summary generation failed. Check proxy and AI configuration.",
+      debug:
+        process.env.NODE_ENV === "development"
+          ? {
+              status,
+              code: err.code,
+              providerMessage,
+            }
+          : undefined,
+    });
+  }
+});
+
+const HOST = process.env.HOST ?? "0.0.0.0";
+
+app.listen(PORT, HOST, () => {
+  console.log(`Proxy up on http://${HOST}:${PORT}`);
   console.log(`CORS origin: ${CORS_ORIGIN}`);
 });
