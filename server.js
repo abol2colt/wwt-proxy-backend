@@ -689,10 +689,97 @@ app.get("/api/sync-gitlab", async (req, res) => {
       });
     }
 
-    async function getRecentGitlabCommits(gitlab) {
-      return getGitlabCommits(gitlab, {
-        per_page: 20,
+    async function getGitlabCurrentUser(gitlab) {
+      const response = await axios.get(`${gitlab.baseUrl}/api/v4/user`, {
+        headers: { "PRIVATE-TOKEN": gitlab.token },
       });
+
+      return response.data;
+    }
+
+    function mapGitlabEventForClient(event) {
+      const pushData = event.push_data || {};
+      const shortId = pushData.commit_to
+        ? String(pushData.commit_to).slice(0, 8)
+        : undefined;
+
+      return {
+        id: `event-${event.id}`,
+        shortId,
+        title:
+          pushData.commit_title ||
+          event.target_title ||
+          event.action_name ||
+          "فعالیت GitLab",
+        message: [
+          event.action_name || "",
+          pushData.ref ? `branch: ${pushData.ref}` : "",
+          pushData.commit_count ? `commits: ${pushData.commit_count}` : "",
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        authorName: event.author?.name || event.author_username || "",
+        createdAt: event.created_at,
+        webUrl: event.target_url || event.project?.web_url || "",
+        source: "gitlab-event",
+        ref: pushData.ref || null,
+        commitCount: pushData.commit_count || 1,
+      };
+    }
+
+    async function getRecentGitlabUserEvents(gitlab, limit = 40) {
+      const currentUser = await getGitlabCurrentUser(gitlab);
+
+      const response = await axios.get(
+        `${gitlab.baseUrl}/api/v4/users/${currentUser.id}/events`,
+        {
+          headers: { "PRIVATE-TOKEN": gitlab.token },
+          params: {
+            action: "pushed",
+            per_page: limit,
+          },
+        },
+      );
+
+      return Array.isArray(response.data)
+        ? response.data.map(mapGitlabEventForClient)
+        : [];
+    }
+
+    async function getRecentGitlabCommitsForCurrentUser(gitlab, limit = 40) {
+      const currentUser = await getGitlabCurrentUser(gitlab);
+
+      const authorCandidates = [
+        currentUser.username,
+        currentUser.name,
+        currentUser.email,
+        currentUser.commit_email,
+      ].filter(Boolean);
+
+      let allCommits = [];
+
+      for (const author of authorCandidates) {
+        const commits = await getGitlabCommits(gitlab, {
+          author,
+          per_page: limit,
+        });
+
+        allCommits.push(...commits);
+      }
+
+      const seen = new Set();
+
+      return allCommits
+        .filter((commit) => {
+          if (!commit?.id || seen.has(commit.id)) return false;
+          seen.add(commit.id);
+          return true;
+        })
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        )
+        .slice(0, limit);
     }
 
     if (branch) {
@@ -777,7 +864,10 @@ app.get("/api/sync-gitlab", async (req, res) => {
     }
 
     if (!commits || commits.length === 0) {
-      const recentCommits = await getRecentGitlabCommits(gitlab);
+      const recentCommits = await getRecentGitlabCommitsForCurrentUser(
+        gitlab,
+        40,
+      );
 
       return res.json({
         success: false,
