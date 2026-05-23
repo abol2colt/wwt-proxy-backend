@@ -1,33 +1,25 @@
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
-
-const { env } = require("./src/config/env");
-const { buildProxyAxiosConfig } = require("./src/config/proxy-agent");
+const { SocksProxyAgent } = require("socks-proxy-agent");
 const app = express();
 const fs = require("fs");
 const path = require("path");
 const RUNTIME_CONFIG_FILE = path.join(__dirname, ".runtime-integrations.json");
-const {
-  mapJiraIssueToExternalTask,
-  getConfiguredJiraSearchFields,
-} = require("./src/mappers/jira.mapper");
 
-const {
-  mapGitlabCommitForClient,
-  normalizeClientEvidenceCommit,
-} = require("./src/mappers/gitlab.mapper");
+const PORT = Number(process.env.PORT ?? 3000);
+const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:4200";
+const USE_SOCKS_PROXY = process.env.USE_SOCKS_PROXY === "true";
+const SOCKS_PROXY_URL =
+  process.env.SOCKS_PROXY_URL ?? "socks5://127.0.0.1:1080";
 
-const { trimTrailingSlash, truncateText } = require("./src/utils/text");
-
-const { maskValue } = require("./src/utils/mask");
-
-const {
-  calculateEvidenceTimeSuggestion,
-} = require("./src/utils/worklog-time-suggestion");
-
-app.use(cors({ origin: env.corsOrigin }));
+app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
+
+const proxyAgent = USE_SOCKS_PROXY
+  ? new SocksProxyAgent(SOCKS_PROXY_URL)
+  : undefined;
 
 function loadRuntimeIntegrationConfig() {
   try {
@@ -42,6 +34,33 @@ function loadRuntimeIntegrationConfig() {
   }
 }
 const runtimeIntegrationConfig = loadRuntimeIntegrationConfig();
+
+function buildGeminiRequestConfig(timeout = 45000) {
+  return {
+    timeout,
+    ...(proxyAgent
+      ? {
+          httpAgent: proxyAgent,
+          httpsAgent: proxyAgent,
+          proxy: false,
+        }
+      : {}),
+  };
+}
+
+const wttMappings = {
+  redesign: { project_id: 22, service_id: 1, contract_id: 1 }, // 22 = WTT
+  neobrk: { project_id: 30, service_id: 1, contract_id: 1 }, // 30 = NeoBRK
+  irpt: { project_id: 33, service_id: 1, contract_id: 1 }, // 33 = IRPT
+};
+
+function getGitlabProjectId() {
+  return process.env.GITLAB_PROJECT_ID || process.env.PROJECT_ID;
+}
+
+const WORK_SESSION_GAP_LIMIT_MINUTES = 90;
+const MIN_WORKLOG_DURATION_MINUTES = 45;
+const MIN_MINUTES_PER_COMMIT = 30;
 
 function saveRuntimeIntegrationConfig() {
   fs.writeFileSync(
@@ -118,6 +137,92 @@ function isGitlabConfigured() {
   return Boolean(gitlab.baseUrl && gitlab.token && gitlab.projectId);
 }
 
+function calculateEvidenceTimeSuggestion(commits) {
+  const sortedCommits = [...commits]
+    .filter((commit) => commit.created_at)
+    .sort(
+      (a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+
+  if (sortedCommits.length === 0) {
+    return {
+      suggestedStartTime: "",
+      suggestedEndTime: "",
+      suggestedDurationMinutes: 0,
+      excludedGapMinutes: 0,
+      confidenceScore: 50,
+      confidenceLabel: "manual-review",
+      reasoning: "No commit timestamp was available.",
+    };
+  }
+
+  let suggestedDurationMinutes = 0;
+  let excludedGapMinutes = 0;
+
+  for (let index = 1; index < sortedCommits.length; index += 1) {
+    const previous = sortedCommits[index - 1];
+    const current = sortedCommits[index];
+    const gapMinutes = toMinutesBetween(
+      previous.created_at,
+      current.created_at,
+    );
+
+    if (gapMinutes <= WORK_SESSION_GAP_LIMIT_MINUTES) {
+      suggestedDurationMinutes += gapMinutes;
+    } else {
+      excludedGapMinutes += gapMinutes;
+    }
+  }
+
+  const effortFloorMinutes = Math.max(
+    MIN_WORKLOG_DURATION_MINUTES,
+    sortedCommits.length * MIN_MINUTES_PER_COMMIT,
+  );
+
+  suggestedDurationMinutes = Math.max(
+    suggestedDurationMinutes,
+    effortFloorMinutes,
+  );
+
+  const firstCommitAt = sortedCommits[0].created_at;
+  const suggestedEndAt = new Date(
+    new Date(firstCommitAt).getTime() + suggestedDurationMinutes * 60000,
+  ).toISOString();
+
+  const lastCommitAt = suggestedEndAt;
+  const confidenceScore =
+    sortedCommits.length >= 3 && excludedGapMinutes === 0
+      ? 88
+      : sortedCommits.length >= 2
+        ? 78
+        : 65;
+
+  return {
+    suggestedStartTime: toTimeHHMM(firstCommitAt),
+    suggestedEndTime: toTimeHHMM(lastCommitAt),
+    suggestedDurationMinutes,
+    excludedGapMinutes,
+    confidenceScore,
+    confidenceLabel:
+      confidenceScore >= 85
+        ? "high"
+        : confidenceScore >= 70
+          ? "medium"
+          : "needs-review",
+    reasoning:
+      excludedGapMinutes > 0
+        ? `فاصله‌های زمانی طولانیِ بیش از ${WORK_SESSION_GAP_LIMIT_MINUTES} دقیقه محاسبه نشدند و حداقل زمان استاندارد برای فعالیت‌ها لحاظ شد.`
+        : "به دلیل نزدیک بودن زمانِ کامیت‌ها به یکدیگر، حداقل زمان استاندارد اعمال شد تا پیشنهاد گزارش کار واقعی‌تر باشد.",
+    firstEvidenceAt: firstCommitAt,
+    lastEvidenceAt: lastCommitAt,
+  };
+}
+
+function isMockIntegrationMode() {
+  return process.env.ENABLE_INTEGRATION_MOCK_MODE !== "false";
+}
+
 function getRequiredEnvMissing(keys) {
   return keys.filter((key) => !process.env[key]);
 }
@@ -149,7 +254,9 @@ function getGitlabMissingEnv() {
 }
 
 function getJiraMode() {
-  return isJiraConfigured() ? "real" : "not-configured";
+  if (isJiraConfigured()) return "real";
+  if (isMockIntegrationMode()) return "mock";
+  return "not-configured";
 }
 
 function getGitlabMode() {
@@ -161,11 +268,13 @@ function getAiMode() {
 }
 
 function getIntegrationMissingEnv() {
-  const missing = [
-    ...getJiraMissingEnv(),
-    ...getGitlabMissingEnv(),
-    ...getAiMissingEnv(),
-  ];
+  const missing = [];
+
+  if (!isMockIntegrationMode()) {
+    missing.push(...getJiraMissingEnv());
+  }
+
+  missing.push(...getGitlabMissingEnv(), ...getAiMissingEnv());
 
   return [...new Set(missing)];
 }
@@ -193,6 +302,87 @@ function requireGitlabAndAiEnv() {
   return true;
 }
 
+function mapMockJiraIssueToExternalTask(issue) {
+  return {
+    id: issue.key,
+    key: issue.key,
+    title: issue.title,
+    project_id: issue.mapping.project_id,
+    service_id: issue.mapping.service_id,
+    contract_id: issue.mapping.contract_id,
+    branch_name: issue.branch,
+    source: "mock-jira",
+  };
+}
+function jiraFieldToPlainText(value) {
+  if (!value) return "";
+
+  if (typeof value === "string") return value;
+
+  if (Array.isArray(value)) {
+    return value.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+  }
+
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.value === "string") return value.value;
+    if (typeof value.name === "string") return value.name;
+
+    if (Array.isArray(value.content)) {
+      return value.content.map(jiraFieldToPlainText).filter(Boolean).join("\n");
+    }
+  }
+
+  return "";
+}
+
+function parseWttMetadataBlock(text) {
+  const source = String(text ?? "");
+  const match = source.match(/WTT:?\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const lines = match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const data = {};
+
+  for (const line of lines) {
+    const [rawKey, ...rawValueParts] = line.split("=");
+    const key = rawKey?.trim();
+    const value = rawValueParts.join("=").trim();
+
+    if (key && value) {
+      data[key] = value;
+    }
+  }
+
+  return {
+    project_id: data.project_id ? Number(data.project_id) : null,
+    service_id: data.service_id ? Number(data.service_id) : null,
+    contract_id: data.contract_id ? Number(data.contract_id) : null,
+    location: data.location || null,
+    gitlab_project: data.gitlab_project || null,
+    branch_name: data.branch_name || null,
+    branch_pattern: data.branch_pattern || null,
+    mapping_source: "jira-description",
+  };
+}
+
+function readCustomField(issue, envName) {
+  const fieldId = process.env[envName];
+
+  if (!fieldId) {
+    return null;
+  }
+
+  return jiraFieldToPlainText(issue.fields?.[fieldId]).trim() || null;
+}
+
 function getTaskKeySearchAliases(taskKey) {
   const key = String(taskKey ?? "").trim();
   const numberPart = key.split("-")[1];
@@ -205,6 +395,135 @@ function getTaskKeySearchAliases(taskKey) {
     numberPart ? `feature/${key}` : "",
   ].filter(Boolean);
 }
+
+function extractWttMetadataFromCustomFields(issue) {
+  const projectId = readCustomField(issue, "JIRA_WTT_PROJECT_FIELD");
+  const serviceId = readCustomField(issue, "JIRA_WTT_SERVICE_FIELD");
+  const contractId = readCustomField(issue, "JIRA_WTT_CONTRACT_FIELD");
+  const location = readCustomField(issue, "JIRA_WTT_LOCATION_FIELD");
+  const gitlabProject = readCustomField(issue, "JIRA_GITLAB_PROJECT_FIELD");
+  const branchPattern = readCustomField(issue, "JIRA_BRANCH_PATTERN_FIELD");
+
+  if (
+    !projectId &&
+    !serviceId &&
+    !contractId &&
+    !location &&
+    !gitlabProject &&
+    !branchPattern
+  ) {
+    return null;
+  }
+
+  return {
+    project_id: projectId ? Number(projectId) : null,
+    service_id: serviceId ? Number(serviceId) : null,
+    contract_id: contractId ? Number(contractId) : null,
+    location: location || null,
+    gitlab_project: gitlabProject || null,
+    branch_pattern: branchPattern || null,
+    mapping_source: "jira-custom-fields",
+  };
+}
+
+function extractWttMetadataFromJiraIssue(issue) {
+  const descriptionText = jiraFieldToPlainText(issue.fields?.description);
+  const fromDescription = parseWttMetadataBlock(descriptionText);
+
+  if (fromDescription) {
+    return fromDescription;
+  }
+
+  return extractWttMetadataFromCustomFields(issue);
+}
+
+function getConfiguredJiraSearchFields() {
+  const baseFields = [
+    "summary",
+    "status",
+    "issuetype",
+    "updated",
+    "description",
+    "project",
+    "assignee",
+    "labels",
+    "components",
+  ];
+
+  const customFields = [
+    process.env.JIRA_WTT_PROJECT_FIELD,
+    process.env.JIRA_WTT_SERVICE_FIELD,
+    process.env.JIRA_WTT_CONTRACT_FIELD,
+    process.env.JIRA_WTT_LOCATION_FIELD,
+    process.env.JIRA_GITLAB_PROJECT_FIELD,
+    process.env.JIRA_BRANCH_PATTERN_FIELD,
+  ].filter(Boolean);
+
+  return [...new Set([...baseFields, ...customFields])].join(",");
+}
+
+function buildBranchNameFromPattern(pattern, key) {
+  if (!pattern) return null;
+
+  const issueNumber = String(key ?? "").split("-")[1] || "";
+
+  return String(pattern)
+    .replaceAll("{TASK_KEY}", key)
+    .replaceAll("{ISSUE_NUMBER}", issueNumber);
+}
+
+function mapJiraIssueToExternalTask(issue, runtimeMapping) {
+  const key = issue.key;
+  const summary = issue.fields?.summary ?? key;
+  const wttMetadata = extractWttMetadataFromJiraIssue(issue);
+
+  const mapping = runtimeMapping
+    ? {
+        project_id: runtimeMapping.project_id,
+        service_id: runtimeMapping.service_id,
+        contract_id: runtimeMapping.contract_id,
+        mapping_source: "runtime",
+      }
+    : wttMetadata;
+
+  const branchPattern = wttMetadata?.branch_pattern ?? null;
+  const branchName =
+    wttMetadata?.branch_name ||
+    (wttMetadata?.branch_pattern
+      ? buildBranchNameFromPattern(wttMetadata.branch_pattern, key)
+      : null);
+
+  return {
+    id: key,
+    key,
+    title: summary,
+
+    project_id: mapping?.project_id ?? null,
+    service_id: mapping?.service_id ?? null,
+    contract_id: mapping?.contract_id ?? null,
+    location: wttMetadata?.location ?? null,
+
+    gitlab_project_id: wttMetadata?.gitlab_project ?? null,
+    branch_pattern: branchPattern,
+    branch_name: branchName,
+    mapping_source: mapping?.mapping_source ?? null,
+
+    status: issue.fields?.status?.name,
+    source: "jira",
+    raw: {
+      updated: issue.fields?.updated,
+      issueType: issue.fields?.issuetype?.name,
+      jiraProjectKey: issue.fields?.project?.key,
+      jiraProjectName: issue.fields?.project?.name,
+      assignee: issue.fields?.assignee?.displayName,
+      labels: issue.fields?.labels ?? [],
+      components: issue.fields?.components ?? [],
+      descriptionText: jiraFieldToPlainText(issue.fields?.description),
+      wttMetadata,
+    },
+  };
+}
+
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -232,8 +551,30 @@ app.get("/api/integrations/status", (req, res) => {
   });
 });
 
+// Legacy manual-testing route. This always returns mock tasks regardless of mock-mode env.
+app.get("/api/jira/mock-tasks", (req, res) => {
+  const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+
+  res.json(response);
+});
+
+function mapGitlabCommitForClient(commit) {
+  return {
+    id: commit.id,
+    shortId: commit.short_id ?? commit.shortId,
+    title: commit.title,
+    message: commit.message,
+    authorName: commit.author_name ?? commit.authorName,
+    createdAt: commit.created_at ?? commit.createdAt,
+    webUrl: commit.web_url ?? commit.webUrl,
+    source: commit.source ?? "gitlab-commit",
+    ref: commit.ref ?? null,
+    commitCount: commit.commitCount ?? 1,
+  };
+}
+
 app.get("/api/sync-gitlab", async (req, res) => {
-  const { taskKey, branch, projectId, preview } = req.query;
+  const { taskKey, branch, projectId } = req.query;
 
   if (!taskKey) {
     return res.status(400).json({
@@ -537,8 +878,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
     } else {
       commits = [];
     }
-    const isPreviewOnly =
-      preview === "true" || preview === "1" || preview === "candidates";
+
     if (!commits || commits.length === 0) {
       let recentCommits = [];
 
@@ -549,25 +889,6 @@ app.get("/api/sync-gitlab", async (req, res) => {
           status: recentErr.response?.status,
           message: recentErr.message,
           data: recentErr.response?.data,
-        });
-      }
-
-      if (isPreviewOnly) {
-        return res.json({
-          success: true,
-          code: "GIT_EVIDENCE_CANDIDATES",
-          description: `برای ${taskKey} شاهد مستقیمی پیدا نشد. از فعالیت‌های اخیر موارد مرتبط را انتخاب کن.`,
-          durationMinutes: 0,
-          commits: [],
-          recentCommits: recentCommits.map(mapGitlabCommitForClient),
-          evidence: {
-            taskKey,
-            branch: branch || undefined,
-            matchedBranches: matchedBranchNames,
-            commitCount: 0,
-            rawCommitCountBeforeTaskKeyFilter,
-            reason: "preview-no-direct-evidence",
-          },
         });
       }
 
@@ -587,45 +908,6 @@ app.get("/api/sync-gitlab", async (req, res) => {
         recentCommits: recentCommits.map(mapGitlabCommitForClient),
       });
     }
-    if (isPreviewOnly) {
-      let recentCommits = [];
-
-      try {
-        recentCommits = await getRecentGitlabCommitsForCurrentUser(gitlab, 40);
-      } catch (recentErr) {
-        console.warn("Recent GitLab evidence preview failed", {
-          status: recentErr.response?.status,
-          message: recentErr.message,
-          data: recentErr.response?.data,
-        });
-      }
-
-      const matchedIds = new Set(commits.map((commit) => commit.id));
-      const recentWithoutDuplicates = recentCommits.filter(
-        (commit) => !matchedIds.has(commit.id),
-      );
-
-      return res.json({
-        success: true,
-        code: "GIT_EVIDENCE_CANDIDATES",
-        description: `${commits.length} شاهد مرتبط با ${taskKey} پیدا شد. قبل از ساخت پیش‌نویس می‌توانی انتخاب‌ها را تغییر بدهی.`,
-        durationMinutes: 0,
-        commits: commits.map((commit) => ({
-          ...mapGitlabCommitForClient(commit),
-          matched: true,
-        })),
-        recentCommits: recentWithoutDuplicates.map(mapGitlabCommitForClient),
-        evidence: {
-          taskKey,
-          branch: branch || undefined,
-          matchedBranches: matchedBranchNames,
-          commitCount: commits.length,
-          rawCommitCountBeforeTaskKeyFilter,
-          reason: "preview-before-ai",
-        },
-      });
-    }
-
     const prompt = [
       "از روی عنوان کامیت‌های زیر، یک گزارش کارکرد فارسی کامل اما خلاصه تولید کن.",
       "خروجی فقط شامل بولت پوینت باشد.",
@@ -644,7 +926,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
       model: process.env.GEMINI_MODEL,
       promptLength: prompt.length,
       commitCount: commits.length,
-      useSocksProxy: env.useSocksProxy,
+      useSocksProxy: USE_SOCKS_PROXY,
     });
 
     const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
@@ -653,7 +935,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
       const aiResp = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }] },
-        buildProxyAxiosConfig(45000),
+        buildGeminiRequestConfig(45000),
       );
 
       console.log("AI Report request finished", {
@@ -759,6 +1041,21 @@ app.get("/api/sync-gitlab", async (req, res) => {
   }
 });
 
+function normalizeClientEvidenceCommit(commit) {
+  return {
+    id: commit.id,
+    short_id: commit.shortId,
+    title: commit.title || commit.message || "GitLab evidence",
+    message: commit.message || commit.title || "",
+    author_name: commit.authorName || "",
+    created_at: commit.createdAt || new Date().toISOString(),
+    web_url: commit.webUrl || "",
+    source: commit.source || "gitlab-commit",
+    ref: commit.ref || null,
+    commitCount: commit.commitCount || 1,
+  };
+}
+
 function buildGitEvidencePrompt({
   taskKey,
   title,
@@ -826,7 +1123,7 @@ async function generateGitEvidenceWorklog({
     const aiResp = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents: [{ parts: [{ text: prompt }] }] },
-      buildProxyAxiosConfig(45000),
+      buildGeminiRequestConfig(45000),
     );
 
     return {
@@ -1126,9 +1423,13 @@ app.get("/api/jira/assigned-tasks", async (req, res) => {
   const jira = getEffectiveJiraConfig();
 
   if (!isJiraConfigured()) {
-    return res.status(503).json({
+    if (isMockIntegrationMode()) {
+      const response = mockJiraIssues.map(mapMockJiraIssueToExternalTask);
+      return res.json(response);
+    }
+
+    return res.status(500).json({
       success: false,
-      code: "JIRA_NOT_CONFIGURED",
       error: "Jira is not configured.",
     });
   }
@@ -1192,6 +1493,10 @@ function reportPurposeInstruction(purpose) {
     default:
       return "هدف گزارش: خلاصه عملکرد کاری.";
   }
+}
+
+function truncateText(value, maxLength = 240) {
+  return String(value ?? "").slice(0, maxLength);
 }
 
 app.post("/api/reports/ai-summary", async (req, res) => {
@@ -1283,7 +1588,7 @@ app.post("/api/reports/ai-summary", async (req, res) => {
     promptLength: prompt.length,
     taskCount: safeTasks.length,
     topActivityCount: safeTopActivities.length,
-    useSocksProxy: env.useSocksProxy,
+    useSocksProxy: USE_SOCKS_PROXY,
   });
 
   try {
@@ -1296,7 +1601,7 @@ app.post("/api/reports/ai-summary", async (req, res) => {
           },
         ],
       },
-      buildProxyAxiosConfig(45000),
+      buildGeminiRequestConfig(45000),
     );
     console.log("AI Report request finished", {
       status: aiResp.status,
@@ -1341,7 +1646,9 @@ app.post("/api/reports/ai-summary", async (req, res) => {
   }
 });
 
-app.listen(env.port, env.host, () => {
-  console.log(`Proxy up on http://${env.host}:${env.port}`);
-  console.log(`CORS origin: ${env.corsOrigin}`);
+const HOST = process.env.HOST ?? "0.0.0.0";
+
+app.listen(PORT, HOST, () => {
+  console.log(`Proxy up on http://${HOST}:${PORT}`);
+  console.log(`CORS origin: ${CORS_ORIGIN}`);
 });
