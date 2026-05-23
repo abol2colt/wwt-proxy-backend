@@ -605,14 +605,18 @@ app.get("/api/jira/mock-tasks", (req, res) => {
 function mapGitlabCommitForClient(commit) {
   return {
     id: commit.id,
-    shortId: commit.short_id,
+    shortId: commit.short_id ?? commit.shortId,
     title: commit.title,
     message: commit.message,
-    authorName: commit.author_name,
-    createdAt: commit.created_at,
-    webUrl: commit.web_url,
+    authorName: commit.author_name ?? commit.authorName,
+    createdAt: commit.created_at ?? commit.createdAt,
+    webUrl: commit.web_url ?? commit.webUrl,
+    source: commit.source ?? "gitlab-commit",
+    ref: commit.ref ?? null,
+    commitCount: commit.commitCount ?? 1,
   };
 }
+
 app.get("/api/sync-gitlab", async (req, res) => {
   const { taskKey, branch, projectId } = req.query;
 
@@ -727,28 +731,11 @@ app.get("/api/sync-gitlab", async (req, res) => {
       };
     }
 
-    async function getRecentGitlabUserEvents(gitlab, limit = 40) {
-      const currentUser = await getGitlabCurrentUser(gitlab);
-
-      const response = await axios.get(
-        `${gitlab.baseUrl}/api/v4/users/${currentUser.id}/events`,
-        {
-          headers: { "PRIVATE-TOKEN": gitlab.token },
-          params: {
-            action: "pushed",
-            per_page: limit,
-          },
-        },
-      );
-
-      return Array.isArray(response.data)
-        ? response.data.map(mapGitlabEventForClient)
-        : [];
-    }
-
-    async function getRecentGitlabCommitsForCurrentUser(gitlab, limit = 40) {
-      const currentUser = await getGitlabCurrentUser(gitlab);
-
+    async function getRecentGitlabAuthoredCommits(
+      gitlab,
+      currentUser,
+      limit = 40,
+    ) {
       const authorCandidates = [
         currentUser.username,
         currentUser.name,
@@ -756,29 +743,102 @@ app.get("/api/sync-gitlab", async (req, res) => {
         currentUser.commit_email,
       ].filter(Boolean);
 
-      let allCommits = [];
+      let commitItems = [];
 
       for (const author of authorCandidates) {
-        const commits = await getGitlabCommits(gitlab, {
-          author,
-          per_page: limit,
-        });
+        try {
+          const commits = await getGitlabCommits(gitlab, {
+            author,
+            per_page: limit,
+          });
 
-        allCommits.push(...commits);
+          commitItems.push(
+            ...commits.map((commit) => ({
+              ...commit,
+              source: "gitlab-commit",
+            })),
+          );
+        } catch (error) {
+          console.warn("GitLab authored commits lookup failed", {
+            author,
+            status: error.response?.status,
+            message: error.message,
+            data: error.response?.data,
+          });
+        }
       }
 
+      return commitItems;
+    }
+    async function getRecentGitlabUserEvents(gitlab, currentUser, limit = 40) {
+      const attempts = [
+        { action: "pushed", per_page: limit },
+        { per_page: limit },
+      ];
+
+      for (const params of attempts) {
+        try {
+          const response = await axios.get(
+            `${gitlab.baseUrl}/api/v4/users/${currentUser.id}/events`,
+            {
+              headers: { "PRIVATE-TOKEN": gitlab.token },
+              params,
+            },
+          );
+
+          const events = Array.isArray(response.data)
+            ? response.data.map(mapGitlabEventForClient)
+            : [];
+
+          if (events.length > 0) {
+            return events;
+          }
+        } catch (error) {
+          console.warn("GitLab user events lookup failed", {
+            params,
+            status: error.response?.status,
+            message: error.message,
+            data: error.response?.data,
+          });
+        }
+      }
+
+      return [];
+    }
+    async function getRecentGitlabCommitsForCurrentUser(gitlab, limit = 40) {
+      const currentUser = await getGitlabCurrentUser(gitlab);
+
+      const eventItems = await getRecentGitlabUserEvents(
+        gitlab,
+        currentUser,
+        limit,
+      );
+      const commitItems = await getRecentGitlabAuthoredCommits(
+        gitlab,
+        currentUser,
+        limit,
+      );
+
+      const mixedItems = [...eventItems, ...commitItems];
       const seen = new Set();
 
-      return allCommits
-        .filter((commit) => {
-          if (!commit?.id || seen.has(commit.id)) return false;
-          seen.add(commit.id);
+      return mixedItems
+        .filter((item) => {
+          const id = `${item.source || "item"}-${item.id}`;
+
+          if (!item?.id || seen.has(id)) {
+            return false;
+          }
+
+          seen.add(id);
           return true;
         })
-        .sort(
-          (a, b) =>
-            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-        )
+        .sort((a, b) => {
+          const dateA = new Date(a.created_at ?? a.createdAt ?? 0).getTime();
+          const dateB = new Date(b.created_at ?? b.createdAt ?? 0).getTime();
+
+          return dateB - dateA;
+        })
         .slice(0, limit);
     }
 
@@ -864,10 +924,17 @@ app.get("/api/sync-gitlab", async (req, res) => {
     }
 
     if (!commits || commits.length === 0) {
-      const recentCommits = await getRecentGitlabCommitsForCurrentUser(
-        gitlab,
-        40,
-      );
+      let recentCommits = [];
+
+      try {
+        recentCommits = await getRecentGitlabCommitsForCurrentUser(gitlab, 40);
+      } catch (recentErr) {
+        console.warn("Recent GitLab evidence fallback failed", {
+          status: recentErr.response?.status,
+          message: recentErr.message,
+          data: recentErr.response?.data,
+        });
+      }
 
       return res.json({
         success: false,
@@ -1016,6 +1083,197 @@ app.get("/api/sync-gitlab", async (req, res) => {
           : undefined,
     });
   }
+});
+
+function normalizeClientEvidenceCommit(commit) {
+  return {
+    id: commit.id,
+    short_id: commit.shortId,
+    title: commit.title || commit.message || "GitLab evidence",
+    message: commit.message || commit.title || "",
+    author_name: commit.authorName || "",
+    created_at: commit.createdAt || new Date().toISOString(),
+    web_url: commit.webUrl || "",
+    source: commit.source || "gitlab-commit",
+    ref: commit.ref || null,
+    commitCount: commit.commitCount || 1,
+  };
+}
+
+function buildGitEvidencePrompt({
+  taskKey,
+  title,
+  branch,
+  commits,
+  tone = "formal",
+  detailLevel = "balanced",
+  extraInstruction = "",
+}) {
+  return [
+    "از روی شواهد GitLab زیر، یک گزارش کارکرد فارسی تولید کن.",
+    "خروجی باید پیش‌نویس قابل بازبینی توسط برنامه‌نویس باشد.",
+    "اگر شواهد push event هستند، با احتیاط بنویس و ادعای قطعی نکن.",
+    "خروجی فقط شامل بولت پوینت‌های کاربردی باشد.",
+    "",
+    `Task key: ${taskKey || "manual"}`,
+    `Task title: ${title || "بدون عنوان"}`,
+    `Branch: ${branch || "not provided"}`,
+    `Tone: ${tone}`,
+    `Detail level: ${detailLevel}`,
+    extraInstruction ? `Extra instruction: ${extraInstruction}` : "",
+    "",
+    "Evidence:",
+    commits
+      .map((commit) => {
+        const meta = [
+          commit.source ? `source=${commit.source}` : "",
+          commit.ref ? `branch=${commit.ref}` : "",
+          commit.author_name ? `author=${commit.author_name}` : "",
+          commit.created_at ? `date=${commit.created_at}` : "",
+        ]
+          .filter(Boolean)
+          .join(" | ");
+
+        return `- ${commit.title}${meta ? ` (${meta})` : ""}`;
+      })
+      .join("\n"),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function generateGitEvidenceWorklog({
+  taskKey,
+  title,
+  branch,
+  commits,
+  tone,
+  detailLevel,
+  extraInstruction,
+}) {
+  const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
+
+  const prompt = buildGitEvidencePrompt({
+    taskKey,
+    title,
+    branch,
+    commits,
+    tone,
+    detailLevel,
+    extraInstruction,
+  });
+
+  try {
+    const aiResp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: [{ parts: [{ text: prompt }] }] },
+      buildGeminiRequestConfig(45000),
+    );
+
+    return {
+      success: true,
+      description: aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
+      durationMinutes: timeSuggestion.suggestedDurationMinutes,
+      suggestedStartTime: timeSuggestion.suggestedStartTime,
+      suggestedEndTime: timeSuggestion.suggestedEndTime,
+      suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
+      excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+      confidenceScore: timeSuggestion.confidenceScore,
+      confidenceLabel: timeSuggestion.confidenceLabel,
+      commits: commits.map(mapGitlabCommitForClient),
+      evidence: {
+        taskKey,
+        branch: branch || undefined,
+        commitCount: commits.length,
+        firstCommitAt: timeSuggestion.firstEvidenceAt,
+        lastCommitAt: timeSuggestion.lastEvidenceAt,
+        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+        reasoning: timeSuggestion.reasoning,
+      },
+    };
+  } catch (aiErr) {
+    const fallbackDescription = [
+      `AI برای ${taskKey || title || "این کار"} در حال حاضر پاسخ نداد یا به محدودیت خورد.`,
+      "شواهد انتخاب‌شده پیدا شدند و می‌توانی متن را دستی از روی آن‌ها تکمیل کنی:",
+      "",
+      ...commits.map((commit) => `- ${commit.title}`),
+    ].join("\n");
+
+    return {
+      success: false,
+      code:
+        aiErr.code === "ECONNABORTED"
+          ? "AI_PROVIDER_TIMEOUT"
+          : "AI_PROVIDER_FAILED",
+      description: fallbackDescription,
+      fallbackDescription,
+      durationMinutes: timeSuggestion.suggestedDurationMinutes,
+      suggestedStartTime: timeSuggestion.suggestedStartTime,
+      suggestedEndTime: timeSuggestion.suggestedEndTime,
+      suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
+      excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+      confidenceScore: 55,
+      confidenceLabel: "manual-review",
+      providerMessage:
+        aiErr.code === "ECONNABORTED"
+          ? "درخواست AI بیشتر از حد مجاز طول کشید."
+          : aiErr.response?.data?.error?.message ||
+            aiErr.response?.data?.message ||
+            aiErr.message,
+      commits: commits.map(mapGitlabCommitForClient),
+      evidence: {
+        taskKey,
+        branch: branch || undefined,
+        commitCount: commits.length,
+        firstCommitAt: timeSuggestion.firstEvidenceAt,
+        lastCommitAt: timeSuggestion.lastEvidenceAt,
+        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
+        reasoning: "شواهد انتخاب شدند اما AI نتوانست پیش‌نویس نهایی بسازد.",
+      },
+    };
+  }
+}
+
+app.post("/api/sync-gitlab/from-commits", async (req, res) => {
+  const missingAiEnv = getAiMissingEnv();
+
+  if (missingAiEnv.length > 0) {
+    return res.status(500).json({
+      success: false,
+      error: `AI configuration is incomplete: ${missingAiEnv.join(", ")}`,
+    });
+  }
+
+  const {
+    taskKey = "",
+    title = "",
+    branch = "",
+    commits = [],
+    tone = "formal",
+    detailLevel = "balanced",
+    extraInstruction = "",
+  } = req.body ?? {};
+
+  if (!Array.isArray(commits) || commits.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "حداقل یک evidence برای تولید گزارش لازم است.",
+    });
+  }
+
+  const normalizedCommits = commits.map(normalizeClientEvidenceCommit);
+
+  const response = await generateGitEvidenceWorklog({
+    taskKey,
+    title,
+    branch,
+    commits: normalizedCommits,
+    tone,
+    detailLevel,
+    extraInstruction,
+  });
+
+  return res.json(response);
 });
 
 app.post("/api/integrations/configure/jira", (req, res) => {
