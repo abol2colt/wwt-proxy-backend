@@ -1,210 +1,72 @@
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
 
 const { env } = require("./src/config/env");
-const { buildProxyAxiosConfig } = require("./src/config/proxy-agent");
 const app = express();
-const fs = require("fs");
-const path = require("path");
-const RUNTIME_CONFIG_FILE = path.join(__dirname, ".runtime-integrations.json");
+const {
+  loadRuntimeIntegrationConfig,
+  saveRuntimeIntegrationConfig,
+} = require("./src/config/runtime-integrations.repository");
+
 const {
   mapJiraIssueToExternalTask,
   getConfiguredJiraSearchFields,
 } = require("./src/mappers/jira.mapper");
 
 const {
+  testJiraConnection,
+  searchJiraIssues,
+} = require("./src/clients/jira.client");
+
+const {
+  generateReportSummary,
+} = require("./src/services/report-summary.service");
+
+const {
   mapGitlabCommitForClient,
   normalizeClientEvidenceCommit,
 } = require("./src/mappers/gitlab.mapper");
 
-const { trimTrailingSlash, truncateText } = require("./src/utils/text");
+const { trimTrailingSlash } = require("./src/utils/text");
 
 const { maskValue } = require("./src/utils/mask");
-
-const {
-  calculateEvidenceTimeSuggestion,
-} = require("./src/utils/worklog-time-suggestion");
 
 app.use(cors({ origin: env.corsOrigin }));
 app.use(express.json());
 
-function loadRuntimeIntegrationConfig() {
-  try {
-    if (!fs.existsSync(RUNTIME_CONFIG_FILE)) {
-      return { jira: null, gitlab: null };
-    }
-
-    return JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, "utf8"));
-  } catch (error) {
-    console.warn("Could not load runtime integration config", error.message);
-    return { jira: null, gitlab: null };
-  }
-}
 const runtimeIntegrationConfig = loadRuntimeIntegrationConfig();
+const {
+  createIntegrationConfigService,
+} = require("./src/services/integration-config.service");
 
-function saveRuntimeIntegrationConfig() {
-  fs.writeFileSync(
-    RUNTIME_CONFIG_FILE,
-    JSON.stringify(runtimeIntegrationConfig, null, 2),
-    "utf8",
-  );
-}
+const integrationConfigService = createIntegrationConfigService(
+  runtimeIntegrationConfig,
+);
 
-function getRuntimeJiraConfig() {
-  return runtimeIntegrationConfig.jira;
-}
+const {
+  getEffectiveJiraConfig,
+  getEffectiveGitlabConfig,
+  isJiraConfigured,
+  getAiMissingEnv,
+  getJiraMode,
+  getGitlabMode,
+  getAiMode,
+  getIntegrationMissingEnv,
+  requireGitlabAndAiEnv,
+} = integrationConfigService;
 
-function getEffectiveJiraConfig() {
-  const runtime = getRuntimeJiraConfig();
+const { testGitlabConnection } = require("./src/clients/gitlab.client");
 
-  return {
-    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.JIRA_BASE_URL),
-    email: runtime?.email || process.env.JIRA_EMAIL,
-    token: runtime?.token || process.env.JIRA_API_TOKEN,
-    authType: runtime?.authType || process.env.JIRA_AUTH_TYPE || "bearer",
-    apiVersion: runtime?.apiVersion || process.env.JIRA_API_VERSION || "2",
-    jql:
-      runtime?.jql ||
-      process.env.JIRA_JQL ||
-      "statusCategory != Done ORDER BY updated DESC",
-    mapping: runtime?.mapping || null,
-  };
-}
+const {
+  getRecentGitlabCommitsForCurrentUser,
+  findEvidenceCommitsForTask,
+} = require("./src/services/gitlab-evidence.service");
 
-function getRuntimeGitlabConfig() {
-  return runtimeIntegrationConfig.gitlab;
-}
+const {
+  generateGitEvidenceWorklog,
+  generateTaskKeyEvidenceWorklog,
+} = require("./src/services/ai-worklog.service");
 
-function getEffectiveGitlabConfig() {
-  const runtime = getRuntimeGitlabConfig();
-
-  return {
-    baseUrl: trimTrailingSlash(runtime?.baseUrl || process.env.GITLAB_URL),
-    username: runtime?.username || process.env.GITLAB_USERNAME || "",
-    token: runtime?.token || process.env.GITLAB_TOKEN,
-    projectId:
-      runtime?.projectId ||
-      process.env.GITLAB_PROJECT_ID ||
-      process.env.PROJECT_ID,
-    branchPattern: runtime?.branchPattern || "feature/{TASK_KEY}",
-  };
-}
-
-function buildJiraAxiosAuthConfig(config) {
-  if (config.authType === "bearer") {
-    return {
-      headers: {
-        Authorization: `Bearer ${config.token}`,
-      },
-    };
-  }
-
-  return {
-    auth: {
-      username: config.email,
-      password: config.token,
-    },
-  };
-}
-
-function isJiraConfigured() {
-  const jira = getEffectiveJiraConfig();
-  return Boolean(jira.baseUrl && jira.email && jira.token);
-}
-
-function isGitlabConfigured() {
-  const gitlab = getEffectiveGitlabConfig();
-  return Boolean(gitlab.baseUrl && gitlab.token && gitlab.projectId);
-}
-
-function getRequiredEnvMissing(keys) {
-  return keys.filter((key) => !process.env[key]);
-}
-
-function getAiMissingEnv() {
-  return getRequiredEnvMissing(["GEMINI_API_KEY", "GEMINI_MODEL"]);
-}
-
-function getJiraMissingEnv() {
-  const jira = getEffectiveJiraConfig();
-  const missing = [];
-
-  if (!jira.baseUrl) missing.push("JIRA_BASE_URL");
-  if (!jira.email) missing.push("JIRA_EMAIL");
-  if (!jira.token) missing.push("JIRA_API_TOKEN");
-
-  return missing;
-}
-
-function getGitlabMissingEnv() {
-  const gitlab = getEffectiveGitlabConfig();
-  const missing = [];
-
-  if (!gitlab.baseUrl) missing.push("GITLAB_URL");
-  if (!gitlab.token) missing.push("GITLAB_TOKEN");
-  if (!gitlab.projectId) missing.push("GITLAB_PROJECT_ID");
-
-  return missing;
-}
-
-function getJiraMode() {
-  return isJiraConfigured() ? "real" : "not-configured";
-}
-
-function getGitlabMode() {
-  return isGitlabConfigured() ? "real" : "not-configured";
-}
-
-function getAiMode() {
-  return getAiMissingEnv().length === 0 ? "real" : "not-configured";
-}
-
-function getIntegrationMissingEnv() {
-  const missing = [
-    ...getJiraMissingEnv(),
-    ...getGitlabMissingEnv(),
-    ...getAiMissingEnv(),
-  ];
-
-  return [...new Set(missing)];
-}
-
-function requireEnv(keys) {
-  const missing = keys.filter((key) => !process.env[key]);
-  if (missing.length > 0) {
-    const error = new Error(`Missing env: ${missing.join(", ")}`);
-    error.statusCode = 500;
-    throw error;
-  }
-  return true;
-}
-
-function requireGitlabAndAiEnv() {
-  const missing = [...getGitlabMissingEnv(), ...getAiMissingEnv()];
-
-  if (missing.length > 0) {
-    const error = new Error(`Missing env: ${missing.join(", ")}`);
-    error.statusCode = 500;
-    error.missingEnv = missing;
-    throw error;
-  }
-
-  return true;
-}
-
-function getTaskKeySearchAliases(taskKey) {
-  const key = String(taskKey ?? "").trim();
-  const numberPart = key.split("-")[1];
-
-  return [
-    key,
-    key.toLowerCase(),
-    numberPart ? `issue-${numberPart}` : "",
-    numberPart ? `bugfix/issue-${numberPart}` : "",
-    numberPart ? `feature/${key}` : "",
-  ].filter(Boolean);
-}
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -258,287 +120,16 @@ app.get("/api/sync-gitlab", async (req, res) => {
       gitlab.projectId = String(projectId);
     }
 
-    async function findGitlabBranchesByTaskKey(gitlab, taskKey) {
-      const response = await axios.get(
-        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/branches`,
-        {
-          headers: { "PRIVATE-TOKEN": gitlab.token },
-          params: {
-            search: taskKey,
-            per_page: 20,
-          },
-        },
-      );
-
-      return Array.isArray(response.data) ? response.data : [];
-    }
-
-    async function getGitlabCommits(gitlab, params) {
-      const response = await axios.get(
-        `${gitlab.baseUrl}/api/v4/projects/${encodeURIComponent(gitlab.projectId)}/repository/commits`,
-        {
-          headers: { "PRIVATE-TOKEN": gitlab.token },
-          params,
-        },
-      );
-
-      return Array.isArray(response.data) ? response.data : [];
-    }
-
-    let commits = [];
-    let matchedBranchNames = [];
-
-    async function findBranchesByAliases(gitlab, taskKey) {
-      let matchedBranches = [];
-
-      for (const alias of getTaskKeySearchAliases(taskKey)) {
-        const branches = await findGitlabBranchesByTaskKey(gitlab, alias);
-        matchedBranches.push(...branches);
-      }
-
-      const seenBranchNames = new Set();
-
-      return matchedBranches.filter((branchItem) => {
-        if (!branchItem?.name || seenBranchNames.has(branchItem.name)) {
-          return false;
-        }
-
-        seenBranchNames.add(branchItem.name);
-        return true;
-      });
-    }
-
-    async function getGitlabCurrentUser(gitlab) {
-      const response = await axios.get(`${gitlab.baseUrl}/api/v4/user`, {
-        headers: { "PRIVATE-TOKEN": gitlab.token },
-      });
-
-      return response.data;
-    }
-
-    function mapGitlabEventForClient(event) {
-      const pushData = event.push_data || {};
-      const shortId = pushData.commit_to
-        ? String(pushData.commit_to).slice(0, 8)
-        : undefined;
-
-      return {
-        id: `event-${event.id}`,
-        shortId,
-        title:
-          pushData.commit_title ||
-          event.target_title ||
-          event.action_name ||
-          "فعالیت GitLab",
-        message: [
-          event.action_name || "",
-          pushData.ref ? `branch: ${pushData.ref}` : "",
-          pushData.commit_count ? `commits: ${pushData.commit_count}` : "",
-        ]
-          .filter(Boolean)
-          .join(" · "),
-        authorName: event.author?.name || event.author_username || "",
-        createdAt: event.created_at,
-        webUrl: event.target_url || event.project?.web_url || "",
-        source: "gitlab-event",
-        ref: pushData.ref || null,
-        commitCount: pushData.commit_count || 1,
-      };
-    }
-
-    async function getRecentGitlabAuthoredCommits(
-      gitlab,
-      currentUser,
-      limit = 40,
-    ) {
-      const authorCandidates = [
-        currentUser.username,
-        currentUser.name,
-        currentUser.email,
-        currentUser.commit_email,
-      ].filter(Boolean);
-
-      let commitItems = [];
-
-      for (const author of authorCandidates) {
-        try {
-          const commits = await getGitlabCommits(gitlab, {
-            author,
-            per_page: limit,
-          });
-
-          commitItems.push(
-            ...commits.map((commit) => ({
-              ...commit,
-              source: "gitlab-commit",
-            })),
-          );
-        } catch (error) {
-          console.warn("GitLab authored commits lookup failed", {
-            author,
-            status: error.response?.status,
-            message: error.message,
-            data: error.response?.data,
-          });
-        }
-      }
-
-      return commitItems;
-    }
-    async function getRecentGitlabUserEvents(gitlab, currentUser, limit = 40) {
-      const attempts = [
-        { action: "pushed", per_page: limit },
-        { per_page: limit },
-      ];
-
-      for (const params of attempts) {
-        try {
-          const response = await axios.get(
-            `${gitlab.baseUrl}/api/v4/users/${currentUser.id}/events`,
-            {
-              headers: { "PRIVATE-TOKEN": gitlab.token },
-              params,
-            },
-          );
-
-          const events = Array.isArray(response.data)
-            ? response.data.map(mapGitlabEventForClient)
-            : [];
-
-          if (events.length > 0) {
-            return events;
-          }
-        } catch (error) {
-          console.warn("GitLab user events lookup failed", {
-            params,
-            status: error.response?.status,
-            message: error.message,
-            data: error.response?.data,
-          });
-        }
-      }
-
-      return [];
-    }
-    async function getRecentGitlabCommitsForCurrentUser(gitlab, limit = 40) {
-      const currentUser = await getGitlabCurrentUser(gitlab);
-
-      const eventItems = await getRecentGitlabUserEvents(
+    const { commits, matchedBranchNames, rawCommitCountBeforeTaskKeyFilter } =
+      await findEvidenceCommitsForTask({
         gitlab,
-        currentUser,
-        limit,
-      );
-      const commitItems = await getRecentGitlabAuthoredCommits(
-        gitlab,
-        currentUser,
-        limit,
-      );
-
-      const mixedItems = [...eventItems, ...commitItems];
-      const seen = new Set();
-
-      return mixedItems
-        .filter((item) => {
-          const id = `${item.source || "item"}-${item.id}`;
-
-          if (!item?.id || seen.has(id)) {
-            return false;
-          }
-
-          seen.add(id);
-          return true;
-        })
-        .sort((a, b) => {
-          const dateA = new Date(a.created_at ?? a.createdAt ?? 0).getTime();
-          const dateB = new Date(b.created_at ?? b.createdAt ?? 0).getTime();
-
-          return dateB - dateA;
-        })
-        .slice(0, limit);
-    }
-
-    if (branch) {
-      commits = await getGitlabCommits(gitlab, {
-        ref_name: branch,
-        per_page: 20,
+        taskKey,
+        branch,
       });
 
-      matchedBranchNames = [branch];
-
-      if (commits.length === 0) {
-        const matchedBranches = await findBranchesByAliases(gitlab, taskKey);
-        matchedBranchNames = matchedBranches.map((item) => item.name);
-
-        for (const matchedBranch of matchedBranches.slice(0, 3)) {
-          const branchCommits = await getGitlabCommits(gitlab, {
-            ref_name: matchedBranch.name,
-            per_page: 20,
-          });
-
-          commits.push(...branchCommits);
-        }
-      }
-
-      if (commits.length === 0) {
-        commits = await getGitlabCommits(gitlab, {
-          search: taskKey,
-          per_page: 20,
-        });
-      }
-    } else {
-      const matchedBranches = await findBranchesByAliases(gitlab, taskKey);
-      matchedBranchNames = matchedBranches.map((item) => item.name);
-
-      for (const matchedBranch of matchedBranches.slice(0, 3)) {
-        const branchCommits = await getGitlabCommits(gitlab, {
-          ref_name: matchedBranch.name,
-          per_page: 20,
-        });
-
-        commits.push(...branchCommits);
-      }
-
-      if (commits.length === 0) {
-        commits = await getGitlabCommits(gitlab, {
-          search: taskKey,
-          per_page: 20,
-        });
-      }
-    }
-
-    const seenCommitIds = new Set();
-
-    commits = commits.filter((commit) => {
-      if (!commit?.id || seenCommitIds.has(commit.id)) {
-        return false;
-      }
-
-      seenCommitIds.add(commit.id);
-      return true;
-    });
-
-    const escapedTaskKey = String(taskKey).replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&",
-    );
-    const taskKeyPattern = new RegExp(`\\[?${escapedTaskKey}\\]?`, "i");
-
-    const taskKeyCommits = commits.filter((commit) => {
-      const title = commit.title || "";
-      const message = commit.message || "";
-
-      return taskKeyPattern.test(title) || taskKeyPattern.test(message);
-    });
-
-    const rawCommitCountBeforeTaskKeyFilter = commits.length;
-
-    if (taskKeyCommits.length > 0) {
-      commits = taskKeyCommits;
-    } else {
-      commits = [];
-    }
     const isPreviewOnly =
       preview === "true" || preview === "1" || preview === "candidates";
+
     if (!commits || commits.length === 0) {
       let recentCommits = [];
 
@@ -587,6 +178,7 @@ app.get("/api/sync-gitlab", async (req, res) => {
         recentCommits: recentCommits.map(mapGitlabCommitForClient),
       });
     }
+
     if (isPreviewOnly) {
       let recentCommits = [];
 
@@ -626,118 +218,25 @@ app.get("/api/sync-gitlab", async (req, res) => {
       });
     }
 
-    const prompt = [
-      "از روی عنوان کامیت‌های زیر، یک گزارش کارکرد فارسی کامل اما خلاصه تولید کن.",
-      "خروجی فقط شامل بولت پوینت باشد.",
-      "قطعیت بیش از حد نده؛ متن باید به عنوان پیش‌نویس قابل بررسی توسط برنامه‌نویس باشد.",
-      "",
-      `Task: ${taskKey}`,
-      `Branch: ${branch || "not provided; searched commits by task key"}`,
-      "",
-      "Commits:",
-      commits.map((c) => `- ${c.title}`).join("\n"),
-    ].join("\n");
-
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-    console.log("GitLab AI sync request started", {
-      model: process.env.GEMINI_MODEL,
-      promptLength: prompt.length,
-      commitCount: commits.length,
-      useSocksProxy: env.useSocksProxy,
+    const response = await generateTaskKeyEvidenceWorklog({
+      taskKey,
+      branch,
+      commits,
+      matchedBranchNames,
+      rawCommitCountBeforeTaskKeyFilter,
     });
 
-    const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
-
-    try {
-      const aiResp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }] },
-        buildProxyAxiosConfig(45000),
-      );
-
-      console.log("AI Report request finished", {
-        status: aiResp.status,
-      });
-
-      return res.json({
-        success: true,
-        description:
-          aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
-        durationMinutes: timeSuggestion.suggestedDurationMinutes,
-        suggestedStartTime: timeSuggestion.suggestedStartTime,
-        suggestedEndTime: timeSuggestion.suggestedEndTime,
-        suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
-        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-        confidenceScore: timeSuggestion.confidenceScore,
-        confidenceLabel: timeSuggestion.confidenceLabel,
-        commits: commits.map(mapGitlabCommitForClient),
-        evidence: {
-          taskKey,
-          branch: branch || undefined,
-          matchedBranches: matchedBranchNames,
-          commitCount: commits.length,
-          firstCommitAt: timeSuggestion.firstEvidenceAt,
-          lastCommitAt: timeSuggestion.lastEvidenceAt,
-          excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-          reasoning: timeSuggestion.reasoning,
-        },
-      });
-    } catch (aiErr) {
-      const providerStatus = aiErr.response?.status ?? 500;
-      const providerMessage =
-        aiErr.code === "ECONNABORTED"
-          ? "درخواست AI بیشتر از حد مجاز طول کشید."
-          : aiErr.response?.data?.error?.message ||
-            aiErr.response?.data?.message ||
-            aiErr.message;
-
-      const fallbackDescription = [
-        `AI برای ${taskKey} در حال حاضر پاسخ نداد یا به محدودیت خورد.`,
-        "کامیت‌های مرتبط پیدا شدند و می‌توانی متن را دستی از روی آن‌ها تکمیل کنی:",
-        "",
-        ...commits.map((commit) => `- ${commit.title}`),
-      ].join("\n");
-
-      return res.json({
-        success: false,
-        code:
-          aiErr.code === "ECONNABORTED"
-            ? "AI_PROVIDER_TIMEOUT"
-            : "AI_PROVIDER_FAILED",
-        description: fallbackDescription,
-        fallbackDescription,
-        durationMinutes: timeSuggestion.suggestedDurationMinutes,
-        suggestedStartTime: timeSuggestion.suggestedStartTime,
-        suggestedEndTime: timeSuggestion.suggestedEndTime,
-        suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
-        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-        confidenceScore: 55,
-        confidenceLabel: "manual-review",
-        providerMessage,
-        commits: commits.map(mapGitlabCommitForClient),
-        evidence: {
-          taskKey,
-          branch: branch || undefined,
-          matchedBranches: matchedBranchNames,
-          commitCount: commits.length,
-          firstCommitAt: timeSuggestion.firstEvidenceAt,
-          lastCommitAt: timeSuggestion.lastEvidenceAt,
-          excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-          reasoning: "کامیت‌ها پیدا شدند اما AI نتوانست پیش‌نویس نهایی بسازد.",
-        },
-      });
-    }
+    return res.json(response);
   } catch (err) {
     const status = err.response?.status ?? 500;
     const providerMessage =
       err.code === "ECONNABORTED"
-        ? "AI provider request timed out after 45 seconds."
+        ? "Provider request timed out after 45 seconds."
         : (err.response?.data?.error?.message ??
           err.response?.data?.message ??
           err.message);
 
-    console.error("AI Report Gen failed", {
+    console.error("GitLab sync failed", {
       status,
       code: err.code,
       message: err.message,
@@ -746,7 +245,8 @@ app.get("/api/sync-gitlab", async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      error: "AI Summary generation failed. Check proxy and AI configuration.",
+      error:
+        "Git evidence sync failed. Check proxy and provider configuration.",
       debug:
         process.env.NODE_ENV === "development"
           ? {
@@ -758,141 +258,6 @@ app.get("/api/sync-gitlab", async (req, res) => {
     });
   }
 });
-
-function buildGitEvidencePrompt({
-  taskKey,
-  title,
-  branch,
-  commits,
-  tone = "formal",
-  detailLevel = "balanced",
-  extraInstruction = "",
-}) {
-  return [
-    "از روی شواهد GitLab زیر، یک گزارش کارکرد فارسی تولید کن.",
-    "خروجی باید پیش‌نویس قابل بازبینی توسط برنامه‌نویس باشد.",
-    "اگر شواهد push event هستند، با احتیاط بنویس و ادعای قطعی نکن.",
-    "خروجی فقط شامل بولت پوینت‌های کاربردی باشد.",
-    "",
-    `Task key: ${taskKey || "manual"}`,
-    `Task title: ${title || "بدون عنوان"}`,
-    `Branch: ${branch || "not provided"}`,
-    `Tone: ${tone}`,
-    `Detail level: ${detailLevel}`,
-    extraInstruction ? `Extra instruction: ${extraInstruction}` : "",
-    "",
-    "Evidence:",
-    commits
-      .map((commit) => {
-        const meta = [
-          commit.source ? `source=${commit.source}` : "",
-          commit.ref ? `branch=${commit.ref}` : "",
-          commit.author_name ? `author=${commit.author_name}` : "",
-          commit.created_at ? `date=${commit.created_at}` : "",
-        ]
-          .filter(Boolean)
-          .join(" | ");
-
-        return `- ${commit.title}${meta ? ` (${meta})` : ""}`;
-      })
-      .join("\n"),
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function generateGitEvidenceWorklog({
-  taskKey,
-  title,
-  branch,
-  commits,
-  tone,
-  detailLevel,
-  extraInstruction,
-}) {
-  const timeSuggestion = calculateEvidenceTimeSuggestion(commits);
-
-  const prompt = buildGitEvidencePrompt({
-    taskKey,
-    title,
-    branch,
-    commits,
-    tone,
-    detailLevel,
-    extraInstruction,
-  });
-
-  try {
-    const aiResp = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      { contents: [{ parts: [{ text: prompt }] }] },
-      buildProxyAxiosConfig(45000),
-    );
-
-    return {
-      success: true,
-      description: aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
-      durationMinutes: timeSuggestion.suggestedDurationMinutes,
-      suggestedStartTime: timeSuggestion.suggestedStartTime,
-      suggestedEndTime: timeSuggestion.suggestedEndTime,
-      suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
-      excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-      confidenceScore: timeSuggestion.confidenceScore,
-      confidenceLabel: timeSuggestion.confidenceLabel,
-      commits: commits.map(mapGitlabCommitForClient),
-      evidence: {
-        taskKey,
-        branch: branch || undefined,
-        commitCount: commits.length,
-        firstCommitAt: timeSuggestion.firstEvidenceAt,
-        lastCommitAt: timeSuggestion.lastEvidenceAt,
-        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-        reasoning: timeSuggestion.reasoning,
-      },
-    };
-  } catch (aiErr) {
-    const fallbackDescription = [
-      `AI برای ${taskKey || title || "این کار"} در حال حاضر پاسخ نداد یا به محدودیت خورد.`,
-      "شواهد انتخاب‌شده پیدا شدند و می‌توانی متن را دستی از روی آن‌ها تکمیل کنی:",
-      "",
-      ...commits.map((commit) => `- ${commit.title}`),
-    ].join("\n");
-
-    return {
-      success: false,
-      code:
-        aiErr.code === "ECONNABORTED"
-          ? "AI_PROVIDER_TIMEOUT"
-          : "AI_PROVIDER_FAILED",
-      description: fallbackDescription,
-      fallbackDescription,
-      durationMinutes: timeSuggestion.suggestedDurationMinutes,
-      suggestedStartTime: timeSuggestion.suggestedStartTime,
-      suggestedEndTime: timeSuggestion.suggestedEndTime,
-      suggestedDurationMinutes: timeSuggestion.suggestedDurationMinutes,
-      excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-      confidenceScore: 55,
-      confidenceLabel: "manual-review",
-      providerMessage:
-        aiErr.code === "ECONNABORTED"
-          ? "درخواست AI بیشتر از حد مجاز طول کشید."
-          : aiErr.response?.data?.error?.message ||
-            aiErr.response?.data?.message ||
-            aiErr.message,
-      commits: commits.map(mapGitlabCommitForClient),
-      evidence: {
-        taskKey,
-        branch: branch || undefined,
-        commitCount: commits.length,
-        firstCommitAt: timeSuggestion.firstEvidenceAt,
-        lastCommitAt: timeSuggestion.lastEvidenceAt,
-        excludedGapMinutes: timeSuggestion.excludedGapMinutes,
-        reasoning: "شواهد انتخاب شدند اما AI نتوانست پیش‌نویس نهایی بسازد.",
-      },
-    };
-  }
-}
-
 app.post("/api/sync-gitlab/from-commits", async (req, res) => {
   const missingAiEnv = getAiMissingEnv();
 
@@ -963,8 +328,7 @@ app.post("/api/integrations/configure/jira", (req, res) => {
       "assignee=currentUser() AND statusCategory != Done ORDER BY updated DESC",
     mapping: null,
   };
-  saveRuntimeIntegrationConfig();
-
+  saveRuntimeIntegrationConfig(runtimeIntegrationConfig);
   return res.json({
     success: true,
     provider: "jira",
@@ -998,8 +362,7 @@ app.post("/api/integrations/configure/gitlab", (req, res) => {
     branchPattern,
   };
 
-  saveRuntimeIntegrationConfig();
-
+  saveRuntimeIntegrationConfig(runtimeIntegrationConfig);
   return res.json({
     success: true,
     provider: "gitlab",
@@ -1030,18 +393,12 @@ app.post("/api/integrations/test/jira", async (req, res) => {
   }
 
   try {
-    const response = await axios.get(
-      `${config.baseUrl}/rest/api/${config.apiVersion}/myself`,
-      buildJiraAxiosAuthConfig(config),
-    );
+    const account = await testJiraConnection(config);
 
     return res.json({
       success: true,
       provider: "jira",
-      account:
-        response.data?.displayName ||
-        response.data?.emailAddress ||
-        config.email,
+      account: account?.displayName || account?.emailAddress || config.email,
     });
   } catch (err) {
     return res.status(err.response?.status ?? 500).json({
@@ -1069,27 +426,19 @@ app.post("/api/integrations/test/gitlab", async (req, res) => {
   }
 
   try {
-    const userResponse = await axios.get(`${config.baseUrl}/api/v4/user`, {
-      headers: { "PRIVATE-TOKEN": config.token },
-    });
+    const { user } = await testGitlabConnection(config);
 
-    const actualUsername = userResponse.data?.username || "";
+    const actualUsername = user?.username || "";
+
     const usernameWarning =
       config.username && actualUsername && config.username !== actualUsername
         ? `Token belongs to "${actualUsername}", not "${config.username}".`
         : null;
 
-    await axios.get(
-      `${config.baseUrl}/api/v4/projects/${encodeURIComponent(config.projectId)}`,
-      {
-        headers: { "PRIVATE-TOKEN": config.token },
-      },
-    );
-
     return res.json({
       success: true,
       provider: "gitlab",
-      account: actualUsername || userResponse.data?.name || "GitLab user",
+      account: actualUsername || user?.name || "GitLab user",
       usernameWarning,
       projectId: config.projectId,
     });
@@ -1134,22 +483,13 @@ app.get("/api/jira/assigned-tasks", async (req, res) => {
   }
 
   try {
-    const response = await axios.get(
-      `${jira.baseUrl}/rest/api/${jira.apiVersion}/search`,
-      {
-        ...buildJiraAxiosAuthConfig(jira),
-        params: {
-          jql: jira.jql,
-          maxResults: 50,
-          fields: getConfiguredJiraSearchFields(),
-        },
-      },
-    );
+    const issues = await searchJiraIssues(jira, {
+      maxResults: 50,
+      fields: getConfiguredJiraSearchFields(),
+    });
 
     return res.json(
-      (response.data.issues ?? []).map((issue) =>
-        mapJiraIssueToExternalTask(issue, jira.mapping),
-      ),
+      issues.map((issue) => mapJiraIssueToExternalTask(issue, jira.mapping)),
     );
   } catch (err) {
     const status = err.response?.status ?? err.statusCode ?? 500;
@@ -1179,20 +519,6 @@ app.get("/api/jira/assigned-tasks", async (req, res) => {
     });
   }
 });
-function reportPurposeInstruction(purpose) {
-  switch (purpose) {
-    case "daily":
-      return "هدف گزارش: ارائه دیلی خیلی کوتاه. خروجی باید نهایتاً ۵ بولت کوتاه باشد و روی کارهای انجام‌شده تمرکز کند.";
-    case "lead":
-      return "هدف گزارش: ارائه به لید فنی. خروجی باید شامل کارهای انجام‌شده، ریسک‌ها، وابستگی‌ها و قدم بعدی باشد.";
-    case "self_review":
-      return "هدف گزارش: ارزیابی شخصی. خروجی باید نقاط قوت، کمبودها، تمرکز زمانی و پیشنهاد بهبود فردی را بگوید.";
-    case "managerial":
-      return "هدف گزارش: گزارش مدیریتی. خروجی باید رسمی، خلاصه، نتیجه‌محور و قابل ارائه به مدیر باشد.";
-    default:
-      return "هدف گزارش: خلاصه عملکرد کاری.";
-  }
-}
 
 app.post("/api/reports/ai-summary", async (req, res) => {
   const missingAiEnv = getAiMissingEnv();
@@ -1204,141 +530,15 @@ app.post("/api/reports/ai-summary", async (req, res) => {
     });
   }
 
-  const {
-    rangeLabel = "",
-    purpose = "daily",
-    tone = "managerial",
-    detailLevel = "balanced",
-    language = "fa",
-    attendanceSummary = {},
-    topActivities = [],
-    tasks = [],
-  } = req.body ?? {};
-
-  const safeTopActivities = Array.isArray(topActivities)
-    ? topActivities.slice(0, 8)
-    : [];
-
-  const safeTasks = Array.isArray(tasks)
-    ? tasks.slice(0, 20).map((task) => ({
-        id: task.id,
-        title: truncateText(task.title, 160),
-        projectTitle: truncateText(task.projectTitle, 80),
-        date: truncateText(task.date, 32),
-        durationMinutes: Number(task.durationMinutes ?? 0),
-        status: truncateText(task.status, 40),
-        description: truncateText(task.description, 260),
-      }))
-    : [];
-
-  const promptLines = [
-    "شما یک دستیار هوش مصنوعی برای تولید گزارش عملکرد پرسنل هستید.",
-    "بر اساس داده‌های واقعی WTT، یک گزارش فارسی حرفه‌ای و قابل بازبینی تولید کن.",
-    "بدون ادعای قطعی و بدون ساختن داده جدید بنویس؛ فقط از داده‌های داده‌شده استفاده کن.",
-    `لحن گزارش: ${tone}`,
-    `سطح جزئیات: ${detailLevel}`,
-    `زبان خروجی: ${language}`,
-    reportPurposeInstruction(purpose),
-    "",
-    `بازه زمانی: ${rangeLabel}`,
-    "خلاصه حضور و غیاب:",
-    `- مجموع حضور: ${attendanceSummary.presenceMinutes ?? 0} دقیقه`,
-    `- کل کارکرد: ${attendanceSummary.totalWorkMinutes ?? 0} دقیقه`,
-    `- کارکرد مورد انتظار: ${attendanceSummary.expectedMinutes ?? 0} دقیقه`,
-    `- اضافه‌کار/کسرکار: ${attendanceSummary.overtimeMinutes ?? 0} دقیقه`,
-    `- راندمان میانگین: ${attendanceSummary.averageEfficiency ?? 0}%`,
-    `- روزهای دارای تسک: ${attendanceSummary.taskDays ?? 0} روز`,
-    `- تعداد ناهار: ${attendanceSummary.lunches ?? 0}`,
-    `- روزهای بدون کارکرد: ${attendanceSummary.noWorkDays ?? 0} روز`,
-    `- مرخصی تاییدشده: ${attendanceSummary.acceptedVacations ?? 0}`,
-    `- ماموریت تاییدشده: ${attendanceSummary.acceptedMissions ?? 0}`,
-    "",
-    "عمده فعالیت‌ها:",
-  ];
-
-  safeTopActivities.forEach((act) => {
-    promptLines.push(
-      `- پروژه ${truncateText(act.projectName, 80)} (${truncateText(act.serviceName, 80)}): ${Number(act.spentMinutes ?? 0)} دقیقه (${truncateText(act.percentageText, 24)})`,
-    );
+  const response = await generateTaskKeyEvidenceWorklog({
+    taskKey,
+    branch,
+    commits,
+    matchedBranchNames,
+    rawCommitCountBeforeTaskKeyFilter,
   });
 
-  promptLines.push("", "تسک‌های ثبت‌شده در این بازه:");
-
-  safeTasks.forEach((task) => {
-    promptLines.push(
-      `- [${task.id}] ${task.title} | پروژه: ${task.projectTitle} | تاریخ: ${task.date} | مدت: ${task.durationMinutes} دقیقه | وضعیت: ${task.status} | توضیح: ${task.description || "بدون توضیح"}`,
-    );
-  });
-
-  promptLines.push(
-    "",
-    "خروجی را منظم، خوانا و آماده ارائه بنویس. اگر هدف daily است خیلی کوتاه بنویس. اگر هدف lead است، ریسک‌ها و قدم بعدی را هم اضافه کن. اگر هدف self_review است، پیشنهاد بهبود فردی بده.",
-  );
-
-  const prompt = promptLines.join("\n");
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-  console.log("AI Report request started", {
-    model: process.env.GEMINI_MODEL,
-    promptLength: prompt.length,
-    taskCount: safeTasks.length,
-    topActivityCount: safeTopActivities.length,
-    useSocksProxy: env.useSocksProxy,
-  });
-
-  try {
-    const aiResp = await axios.post(
-      geminiUrl,
-      {
-        contents: [
-          {
-            parts: [{ text: prompt }],
-          },
-        ],
-      },
-      buildProxyAxiosConfig(45000),
-    );
-    console.log("AI Report request finished", {
-      status: aiResp.status,
-    });
-
-    const generatedText =
-      aiResp.data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
-    return res.json({
-      success: true,
-      summary: generatedText,
-      model: process.env.GEMINI_MODEL,
-    });
-  } catch (err) {
-    const status = err.response?.status ?? 500;
-    const providerMessage =
-      err.code === "ECONNABORTED"
-        ? "AI provider request timed out after 45 seconds."
-        : (err.response?.data?.error?.message ??
-          err.response?.data?.message ??
-          err.message);
-
-    console.error("AI Report Gen failed", {
-      status,
-      code: err.code,
-      message: err.message,
-      providerMessage,
-    });
-
-    return res.status(500).json({
-      success: false,
-      error: "AI Summary generation failed. Check proxy and AI configuration.",
-      debug:
-        process.env.NODE_ENV === "development"
-          ? {
-              status,
-              code: err.code,
-              providerMessage,
-            }
-          : undefined,
-    });
-  }
+  return res.json(response);
 });
 
 app.listen(env.port, env.host, () => {
