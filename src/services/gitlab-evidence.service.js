@@ -170,7 +170,12 @@ async function getRecentGitlabCommitsForCurrentUser(gitlab, limit = 40) {
 }
 
 function filterCommitsByTaskKey(commits, taskKey) {
+  if (!isTrustedTaskKey(taskKey)) {
+    return [];
+  }
+
   const escapedTaskKey = String(taskKey).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
   const taskKeyPattern = new RegExp(`\\[?${escapedTaskKey}\\]?`, "i");
 
   return commits.filter((commit) => {
@@ -195,6 +200,13 @@ function dedupeCommits(commits) {
 }
 
 async function findEvidenceCommitsForTask({ gitlab, taskKey, branch }) {
+  if (!isTrustedTaskKey(taskKey)) {
+    return {
+      commits: [],
+      matchedBranchNames: [],
+      rawCommitCountBeforeTaskKeyFilter: 0,
+    };
+  }
   let commits = [];
   let matchedBranchNames = [];
 
@@ -249,6 +261,14 @@ async function findEvidenceCommitsForTask({ gitlab, taskKey, branch }) {
 
   commits = dedupeCommits(commits);
 
+  if (commits.length > 0) {
+    const currentGitlabUser = await getGitlabCurrentUser(gitlab);
+
+    commits = commits.filter((commit) =>
+      isCommitOwnedByGitlabUser(commit, currentGitlabUser),
+    );
+  }
+
   const rawCommitCountBeforeTaskKeyFilter = commits.length;
   const taskKeyCommits = filterCommitsByTaskKey(commits, taskKey);
 
@@ -261,6 +281,39 @@ async function findEvidenceCommitsForTask({ gitlab, taskKey, branch }) {
   };
 }
 
+function isTrustedTaskKey(taskKey) {
+  return /^[A-Z][A-Z0-9]+-\d+$/i.test(String(taskKey || "").trim());
+}
+
+function normalizeGitIdentity(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isCommitOwnedByGitlabUser(commit, currentUser) {
+  const currentUserIdentities = new Set(
+    [
+      currentUser?.username,
+      currentUser?.name,
+      currentUser?.email,
+      currentUser?.commit_email,
+    ]
+      .filter(Boolean)
+      .map(normalizeGitIdentity),
+  );
+
+  return [
+    commit.author_name,
+    commit.author_email,
+    commit.committer_name,
+    commit.committer_email,
+  ]
+    .filter(Boolean)
+    .map(normalizeGitIdentity)
+    .some((identity) => currentUserIdentities.has(identity));
+}
+
 module.exports = {
   getTaskKeySearchAliases,
   findBranchesByAliases,
@@ -268,4 +321,7 @@ module.exports = {
   filterCommitsByTaskKey,
   dedupeCommits,
   findEvidenceCommitsForTask,
+  isTrustedTaskKey,
+  normalizeGitIdentity,
+  isCommitOwnedByGitlabUser,
 };
